@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+keys/*.pem
+keys/*.key
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+
+# OS / editor cruft
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo

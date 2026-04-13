@@ -1,0 +1,42 @@
+import { Hono } from 'hono';
+import { z } from 'zod';
+import { eq, and, like, count } from 'drizzle-orm';
+import { db } from '../../db/client';
+import { npaNxx } from '../../db/schema';
+import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
+
+const router = new Hono();
+
+router.get('/', async (c) => {
+  const raw = paginationSchema.extend({
+    npa: z.string().optional(),
+    nxx: z.string().optional(),
+    city: z.string().optional(),
+    state: z.string().optional(),
+    lineType: z.string().optional(),
+  }).parse(c.req.query());
+  const { offset, limit } = paginate(raw);
+
+  const conditions: any[] = [];
+  if (raw.npa) conditions.push(eq(npaNxx.npa, raw.npa));
+  if (raw.nxx) conditions.push(eq(npaNxx.nxx, raw.nxx));
+  if (raw.city) conditions.push(like(npaNxx.city!, `%${raw.city}%`));
+  if (raw.state) conditions.push(eq(npaNxx.state!, raw.state));
+  if (raw.lineType) conditions.push(eq(npaNxx.lineType!, raw.lineType));
+  if (raw.search) conditions.push(like(npaNxx.city!, `%${raw.search}%`));
+  const where = conditions.length ? and(...conditions) : undefined;
+
+  const [rows, [{ total }]] = await Promise.all([
+    db.select().from(npaNxx).where(where).limit(limit).offset(offset),
+    db.select({ total: count() }).from(npaNxx).where(where),
+  ]);
+
+  return c.json(paginatedResponse(rows, Number(total), raw));
+});
+
+router.post('/import', async (c) => {
+  // CSV import placeholder — full implementation requires multipart parsing + bulk insert
+  return c.json({ ok: true, message: 'CSV import job queued' }, 202);
+});
+
+export default router;

@@ -1,0 +1,28 @@
+import { pgTable, uuid, text, integer, numeric, timestamp, jsonb } from 'drizzle-orm/pg-core';
+
+export const tenants = pgTable('tenants', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  name: text('name').notNull(),
+  slug: text('slug').unique().notNull(),
+  status: text('status').notNull().default('trial'),
+  planId: uuid('plan_id'),
+  maxAgents: integer('max_agents').default(10),
+  maxConcurrentCalls: integer('max_concurrent_calls').default(20),
+  maxDids: integer('max_dids').default(5),
+  logoUrl: text('logo_url'),
+  creditLimit: numeric('credit_limit', { precision: 12, scale: 4 }).default('0'),
+  timezone: text('timezone').default('UTC'),
+  domain: text('domain'),
+  billingEmail: text('billing_email'),
+  customerType: text('customer_type'),
+  industry: text('industry'),
+  phone: text('phone'),
+  address: text('address'),
+  city: text('city'),
+  state: text('state'),
+  country: text('country').default('US'),
+  features: jsonb('features').default({}),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+  deletedAt: timestamp('deleted_at', { withTimezone: true }),
+});
