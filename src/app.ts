@@ -5,6 +5,7 @@ import { secureHeaders } from 'hono/secure-headers';
 import { corsMiddleware } from './middleware/cors';
 import { requestIdMiddleware } from './middleware/request-id';
 import { errorHandler } from './middleware/error-handler';
+import { rateLimit } from './middleware/rate-limit';
 import { logger } from './lib/logger';
 import api from './routes';
 
@@ -31,6 +32,11 @@ app.onError(errorHandler);
 
 // Health check
 app.get('/health', (c) => c.json({ status: 'ok', time: new Date().toISOString() }));
+
+// Rate limits on abuse-prone surfaces (IP-keyed; Redis-backed)
+app.use('/api/v1/auth/login',     rateLimit({ max: 10, windowSeconds: 60, prefix: 'login' }));
+app.use('/api/v1/auth/refresh',   rateLimit({ max: 20, windowSeconds: 60, prefix: 'refresh' }));
+app.use('/api/v1/public/*',       rateLimit({ max: 30, windowSeconds: 60, prefix: 'public' }));
 
 // API routes
 app.route('/api/v1', api);

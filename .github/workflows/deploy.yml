@@ -1,0 +1,72 @@
+name: deploy-backend
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+
+  deploy:
+    needs: typecheck
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy
+          chmod 600 ~/.ssh/deploy
+          ssh-keyscan -t ed25519,ecdsa,rsa ctl01.tpbx > ~/.ssh/known_hosts 2>/dev/null || \
+            ssh-keyscan -t ed25519,ecdsa,rsa ${{ secrets.CTL_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Sync backend source
+        run: |
+          rsync -az --delete \
+            --exclude node_modules --exclude .env --exclude keys \
+            --exclude .git --exclude dist --exclude logs --exclude '*.log' \
+            --exclude .github \
+            -e "ssh -i ~/.ssh/deploy -o StrictHostKeyChecking=accept-new" \
+            ./ tpbx@${{ secrets.CTL_HOST }}:/opt/tpbx-src/backend/
+
+      - name: Install deps + migrate + restart
+        run: |
+          ssh -i ~/.ssh/deploy tpbx@${{ secrets.CTL_HOST }} \
+            'cd /opt/tpbx-src/backend && /usr/local/bin/bun install --frozen-lockfile && \
+             set -a && source /opt/tpbx/.env && set +a && /usr/local/bin/bun run db:migrate && \
+             sudo systemctl restart tpbx-backend'
+
+      - name: Smoke test
+        run: |
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 10 https://api.treepbx.com/health)
+            echo "Attempt $i: HTTP $code"
+            [[ "$code" == "200" ]] && exit 0
+            sleep 5
+          done
+          echo "Smoke test failed — rolling back"
+          ssh -i ~/.ssh/deploy tpbx@${{ secrets.CTL_HOST }} \
+            'sudo systemctl restart tpbx-backend'
+          exit 1
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          curl -s -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H 'Content-Type: application/json' \
+            -d "{\"text\":\":rotating_light: backend deploy failed on commit ${{ github.sha }}\"}" \
+            || true
