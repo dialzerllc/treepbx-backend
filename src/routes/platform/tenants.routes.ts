@@ -134,7 +134,9 @@ router.post('/', async (c) => {
 
 router.put('/:id', async (c) => {
   const body = updateTenantSchema.parse(await c.req.json());
-  const [row] = await db.update(tenants).set({ ...body, updatedAt: new Date() })
+  // Drop explicit-null fields so notNull columns (e.g. slug) don't get rejected
+  const cleaned = Object.fromEntries(Object.entries(body).filter(([, v]) => v !== null));
+  const [row] = await db.update(tenants).set({ ...cleaned, updatedAt: new Date() })
     .where(and(eq(tenants.id, c.req.param('id')), isNull(tenants.deletedAt))).returning();
   if (!row) throw new NotFound('Tenant not found');
   const [plan] = row.planId ? await db.select({ name: plans.name }).from(plans).where(eq(plans.id, row.planId)) : [];

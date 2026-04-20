@@ -61,7 +61,7 @@ async function checkHost(host: string, port: number): Promise<boolean> {
  */
 async function reapStaleCalls() {
   try {
-    const staleThreshold = new Date(Date.now() - 10 * 60 * 1000).toISOString(); // 10 minutes
+    const staleThreshold = new Date(Date.now() - 10 * 60 * 1000); // 10 minutes ago
 
     // 1. Close orphaned calls (ringing/answered for > 10 min with no end)
     const staleCalls = await db.update(calls).set({
