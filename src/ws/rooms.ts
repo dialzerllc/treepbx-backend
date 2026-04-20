@@ -31,11 +31,24 @@ export function leaveAllRooms(ws: ServerWebSocket<WsData>) {
 
 export function broadcastToRoom(room: string, event: string, data: unknown) {
   const members = rooms.get(room);
-  if (!members) return;
+  if (!members || members.size === 0) return;
   const message = JSON.stringify({ event, data });
   for (const ws of members) {
     ws.send(message);
   }
+}
+
+export function sendToAgent(agentId: string, event: string, data: unknown, excludeUserId?: string) {
+  const room = rooms.get(`agent:${agentId}`);
+  if (!room) return false;
+  const message = JSON.stringify({ event, data });
+  let sent = 0;
+  for (const ws of room) {
+    if (excludeUserId && ws.data.user.sub === excludeUserId) continue;
+    ws.send(message);
+    sent++;
+  }
+  return sent > 0;
 }
 
 export function broadcastToAll(event: string, data: unknown) {

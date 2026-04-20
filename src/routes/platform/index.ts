@@ -28,7 +28,7 @@ platform.route('/plans', plansRouter);
 platform.route('/users', usersRouter);
 platform.route('/carriers', carriersRouter);
 platform.route('/rate-groups', rateGroupsRouter);
-platform.route('/platform-dids', platformDidsRouter);
+platform.route('/dids', platformDidsRouter);
 platform.route('/gpu-servers', gpuServersRouter);
 platform.route('/scaling', scalingRouter);
 platform.route('/gpu-scaling', gpuScalingRouter);

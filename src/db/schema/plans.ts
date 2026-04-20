@@ -14,5 +14,13 @@ export const plans = pgTable('plans', {
   features: jsonb('features').default([]),
   popular: boolean('popular').default(false),
   active: boolean('active').default(true),
+  // SLA
+  slaUptimePct: numeric('sla_uptime_pct', { precision: 5, scale: 2 }).default('99.90'),
+  slaResponseMinutes: integer('sla_response_minutes').default(60),
+  slaResolutionHours: integer('sla_resolution_hours').default(24),
+  slaSupportHours: text('sla_support_hours').default('business'),
+  slaPriorityRouting: boolean('sla_priority_routing').default(false),
+  slaDedicatedManager: boolean('sla_dedicated_manager').default(false),
+  slaCustomIntegrations: boolean('sla_custom_integrations').default(false),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
 });

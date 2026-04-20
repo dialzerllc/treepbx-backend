@@ -1,33 +1,35 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { eq, and, desc, gte, sql } from 'drizzle-orm';
+import { eq, and, desc, gte, sql, inArray } from 'drizzle-orm';
 import { db } from '../../db/client';
-import { calls, leads, users } from '../../db/schema';
+import { calls, leads, users, campaigns, scripts, agentLeadLists, leadLists } from '../../db/schema';
+import { count, asc } from 'drizzle-orm';
 
 const router = new Hono();
 
-// GET /call-history — recent calls for this agent
+// GET /call-history — recent calls for this agent or all calls for tenant admin
 router.get('/call-history', async (c) => {
   const userId = c.get('user').sub;
+  const tenantId = c.get('tenantId')!;
+  const userRole = c.get('user').role;
 
+  // Agent desktop always shows only the logged-in user's calls
+  // (tenant-wide call history is on the Call Trace page, not here)
+
+  // Agent sees only calls assigned to their user ID
   const history = await db
     .select({
-      id: calls.id,
-      direction: calls.direction,
-      callerId: calls.callerId,
-      callerName: calls.callerName,
-      calleeNumber: calls.calleeNumber,
-      status: calls.status,
-      disposition: calls.disposition,
-      durationSeconds: calls.durationSeconds,
-      startedAt: calls.startedAt,
+      id: calls.id, direction: calls.direction, callerId: calls.callerId,
+      callerName: calls.callerName, calleeNumber: calls.calleeNumber, calleeName: calls.calleeName,
+      status: calls.status, disposition: calls.disposition,
+      durationSeconds: calls.durationSeconds, talkTimeSeconds: calls.talkTimeSeconds, startedAt: calls.startedAt,
     })
     .from(calls)
-    .where(eq(calls.agentId, userId))
+    .where(and(eq(calls.tenantId, tenantId), eq(calls.agentId, userId)))
     .orderBy(desc(calls.startedAt))
     .limit(50);
 
-  return c.json(history);
+  return c.json({ data: history });
 });
 
 // GET /stats/today
@@ -46,7 +48,13 @@ router.get('/stats/today', async (c) => {
     .from(calls)
     .where(and(eq(calls.agentId, userId), gte(calls.startedAt, today)));
 
-  return c.json(stats);
+  const avgMin = Math.floor(Number(stats.avgDuration) / 60);
+  const avgSec = Number(stats.avgDuration) % 60;
+  return c.json({
+    ...stats,
+    avgDuration: `${avgMin}m ${avgSec}s`,
+    totalTalkTime: `${Math.floor(Number(stats.talkTime) / 60)}m`,
+  });
 });
 
 // GET /lead/:id — lead info for current call
@@ -58,6 +66,69 @@ router.get('/lead/:id', async (c) => {
     .limit(1);
   if (!lead) return c.json(null);
   return c.json(lead);
+});
+
+// GET /call/lead — lead info for agent's current/recent call
+router.get('/call/lead', async (c) => {
+  const userId = c.get('user').sub;
+  const tenantId = c.get('tenantId')!;
+  const { or, like } = await import('drizzle-orm');
+
+  // Find agent's most recent call (within last 5 min)
+  const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
+  const [activeCall] = await db.select({ leadId: calls.leadId, callerId: calls.callerId, calleeNumber: calls.calleeNumber })
+    .from(calls)
+    .where(and(eq(calls.agentId, userId), gte(calls.startedAt, fiveMinAgo)))
+    .orderBy(desc(calls.startedAt))
+    .limit(1);
+
+  if (!activeCall) return c.json(null);
+
+  // If call has a leadId, use it directly
+  if (activeCall.leadId) {
+    const [lead] = await db.select().from(leads)
+      .where(and(eq(leads.id, activeCall.leadId), eq(leads.tenantId, tenantId)));
+    return c.json(lead || null);
+  }
+
+  // Otherwise, look up lead by phone number match (caller or callee)
+  const phoneNumbers = [activeCall.callerId, activeCall.calleeNumber].filter(Boolean);
+  if (phoneNumbers.length === 0) return c.json(null);
+
+  const conditions = phoneNumbers.map((p) => like(leads.phone, `%${p!.replace(/\D/g, '').slice(-10)}%`));
+  const [lead] = await db.select().from(leads)
+    .where(and(eq(leads.tenantId, tenantId), or(...conditions)))
+    .limit(1);
+
+  return c.json(lead || null);
+});
+
+// GET /call/script — script steps for agent's current active call's campaign
+router.get('/call/script', async (c) => {
+  const userId = c.get('user').sub;
+  const tenantId = c.get('tenantId')!;
+
+  // Find agent's active or recent call and its campaign
+  const fiveMinAgo2 = new Date(Date.now() - 5 * 60 * 1000);
+  const [activeCall] = await db.select({ campaignId: calls.campaignId })
+    .from(calls)
+    .where(and(eq(calls.agentId, userId), gte(calls.startedAt, fiveMinAgo2)))
+    .orderBy(desc(calls.startedAt))
+    .limit(1);
+
+  if (!activeCall?.campaignId) return c.json({ data: [] });
+
+  // Find campaign's script
+  const [campaign] = await db.select({ scriptId: campaigns.scriptId })
+    .from(campaigns)
+    .where(and(eq(campaigns.id, activeCall.campaignId), eq(campaigns.tenantId, tenantId)));
+
+  if (!campaign?.scriptId) return c.json({ data: [] });
+
+  const [script] = await db.select().from(scripts)
+    .where(eq(scripts.id, campaign.scriptId));
+
+  return c.json({ data: script?.steps || [] });
 });
 
 // POST /call/answer — answer incoming call (ESL stub)
@@ -105,9 +176,9 @@ router.post('/call/transfer', async (c) => {
 const dispositionSchema = z.object({
   callId: z.string().uuid(),
   disposition: z.string(),
-  note: z.string().optional(),
-  callbackTime: z.string().optional(),
-  summary: z.string().optional(),
+  note: z.string().nullable().optional(),
+  callbackTime: z.string().nullable().optional(),
+  summary: z.string().nullable().optional(),
 });
 
 router.post('/call/disposition', async (c) => {
@@ -134,6 +205,71 @@ router.post('/call/disposition', async (c) => {
 router.post('/call/dial', async (c) => {
   const { number } = await c.req.json<{ number: string }>();
   return c.json({ ok: true, action: 'dial', number });
+});
+
+// GET /my-lists — agent's assigned lead lists with lead counts
+router.get('/my-lists', async (c) => {
+  const user = c.get('user');
+  const agentId = user.sub;
+
+  const assigned = await db.select({
+    leadListId: agentLeadLists.leadListId,
+    name: leadLists.name,
+    description: leadLists.description,
+    status: leadLists.status,
+  }).from(agentLeadLists)
+    .innerJoin(leadLists, eq(agentLeadLists.leadListId, leadLists.id))
+    .where(eq(agentLeadLists.agentId, agentId));
+
+  // Get lead counts per list
+  const listIds = assigned.map((a) => a.leadListId);
+  const counts = listIds.length > 0
+    ? await db.select({ leadListId: leads.leadListId, total: count(), pending: sql<number>`count(*) filter (where ${leads.status} = 'pending')` })
+        .from(leads).where(inArray(leads.leadListId, listIds)).groupBy(leads.leadListId)
+    : [];
+  const countMap = Object.fromEntries(counts.map((c) => [c.leadListId, { total: Number(c.total), pending: Number(c.pending) }]));
+
+  const data = assigned.map((a) => ({
+    ...a,
+    id: a.leadListId,
+    leadCount: countMap[a.leadListId]?.total ?? 0,
+    pendingCount: countMap[a.leadListId]?.pending ?? 0,
+  }));
+
+  return c.json({ data });
+});
+
+// GET /my-lists/:listId/leads — paginated leads from an assigned list
+router.get('/my-lists/:listId/leads', async (c) => {
+  const user = c.get('user');
+  const agentId = user.sub;
+  const listId = c.req.param('listId');
+
+  // Verify agent is assigned to this list
+  const [assignment] = await db.select({ leadListId: agentLeadLists.leadListId })
+    .from(agentLeadLists).where(and(eq(agentLeadLists.agentId, agentId), eq(agentLeadLists.leadListId, listId)));
+  if (!assignment) return c.json({ data: [], total: 0 });
+
+  const raw = z.object({
+    page: z.coerce.number().default(1),
+    limit: z.coerce.number().default(25),
+    search: z.string().optional(),
+  }).parse(c.req.query());
+
+  const conditions: any[] = [eq(leads.leadListId, listId)];
+  if (raw.search) {
+    conditions.push(sql`(${leads.phone} ILIKE ${'%' + raw.search + '%'} OR ${leads.firstName} ILIKE ${'%' + raw.search + '%'} OR ${leads.lastName} ILIKE ${'%' + raw.search + '%'} OR ${leads.company} ILIKE ${'%' + raw.search + '%'})`);
+  }
+
+  const offset = (raw.page - 1) * raw.limit;
+  const [rows, [{ total }]] = await Promise.all([
+    db.select().from(leads).where(and(...conditions))
+      .orderBy(sql`CASE WHEN ${leads.status} = 'pending' THEN 0 ELSE 1 END`, asc(leads.createdAt))
+      .limit(raw.limit).offset(offset),
+    db.select({ total: count() }).from(leads).where(and(...conditions)),
+  ]);
+
+  return c.json({ data: rows, total: Number(total), page: raw.page, limit: raw.limit });
 });
 
 export default router;

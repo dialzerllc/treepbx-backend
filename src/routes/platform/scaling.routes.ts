@@ -11,16 +11,16 @@ const router = new Hono();
 const ruleSchema = z.object({
   name: z.string().min(1),
   serviceType: z.string().min(1),
-  serverType: z.string().optional(),
-  location: z.string().optional(),
+  serverType: z.string().nullable().optional(),
+  location: z.string().nullable().optional(),
   metric: z.string().min(1),
   thresholdUp: z.string(),
   thresholdDown: z.string(),
-  minInstances: z.number().int().min(0).default(1),
-  maxInstances: z.number().int().positive().default(10),
-  cooldownSeconds: z.number().int().positive().default(300),
-  callsPerInstance: z.number().int().min(0).default(0),
-  enabled: z.boolean().default(true),
+  minInstances: z.coerce.number().int().default(1),
+  maxInstances: z.coerce.number().int().default(10),
+  cooldownSeconds: z.coerce.number().int().default(300),
+  callsPerInstance: z.coerce.number().int().default(0),
+  enabled: z.boolean().nullable().default(true),
 });
 
 router.get('/', async (c) => {
@@ -39,9 +39,9 @@ router.get('/', async (c) => {
 // Scaling events history
 router.get('/events', async (c) => {
   const raw = paginationSchema.extend({
-    serviceType: z.string().optional(),
-    status: z.string().optional(),
-  }).parse(c.req.query());
+    serviceType: z.string().nullable().optional(),
+    status: z.string().nullable().optional(),
+  }).passthrough().parse(c.req.query());
   const { offset, limit } = paginate(raw);
 
   const conditions = [];
@@ -59,9 +59,9 @@ router.get('/events', async (c) => {
 // Hetzner servers infra dashboard
 router.get('/hetzner', async (c) => {
   const raw = paginationSchema.extend({
-    role: z.string().optional(),
-    status: z.string().optional(),
-  }).parse(c.req.query());
+    role: z.string().nullable().optional(),
+    status: z.string().nullable().optional(),
+  }).passthrough().parse(c.req.query());
   const { offset, limit } = paginate(raw);
 
   const conditions = [];

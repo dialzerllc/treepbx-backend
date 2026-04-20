@@ -8,6 +8,8 @@ export const teams = pgTable('teams', {
   name: text('name').notNull(),
   description: text('description'),
   supervisorId: uuid('supervisor_id').references(() => users.id),
+  scriptId: uuid('script_id'),
+  skills: text('skills').array().default([]),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
 });
 

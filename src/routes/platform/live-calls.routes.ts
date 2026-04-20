@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
+import { optionalUuid } from '../../lib/zod-helpers';
 import { inArray, and, eq, desc, count } from 'drizzle-orm';
 import { db } from '../../db/client';
 import { calls } from '../../db/schema';
@@ -10,7 +11,7 @@ const router = new Hono();
 
 router.get('/', async (c) => {
   const raw = paginationSchema.extend({
-    tenantId: z.string().uuid().optional(),
+    tenantId: optionalUuid(),
   }).parse(c.req.query());
   const { offset, limit } = paginate(raw);
 

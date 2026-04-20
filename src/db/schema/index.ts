@@ -32,6 +32,8 @@ export * from './call-recordings';
 export * from './teams';
 export * from './skills';
 export * from './agent-sessions';
+export * from './agent-dids';
+export * from './agent-lead-lists';
 
 // AI / Voicebot
 export * from './voicebot-configs';
@@ -53,12 +55,30 @@ export * from './scaling-events';
 // Communication
 export * from './chat-channels';
 export * from './chat-messages';
+export * from './chat-reactions';
+export * from './dm-conversations';
 export * from './support-tickets';
 export * from './schedule-events';
 export * from './follow-up-todos';
+
+// Scripts & Blocklist
+export * from './scripts';
+export * from './blocklist';
+
+// STIR/SHAKEN
+export * from './stir-shaken';
+
+// Service Metrics
+export * from './service-metrics';
 
 // Integrations & Compliance
 export * from './crm-integrations';
 export * from './api-keys';
 export * from './webhooks';
 export * from './fraud-keywords';
+
+// Public website
+export * from './contact-submissions';
+
+// Autoscaler / media fleet
+export * from './media-nodes';

@@ -8,6 +8,12 @@ const router = new Hono();
 router.get('/', async (c) => {
   const tenantId = c.get('tenantId')!;
 
+  // Check Redis cache first (15s TTL for dashboard)
+  const { cacheGet, cacheSet } = await import('../../lib/redis');
+  const cacheKey = `dashboard:${tenantId}`;
+  const cached = await cacheGet(cacheKey);
+  if (cached) return c.json(cached);
+
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
 
@@ -59,7 +65,7 @@ router.get('/', async (c) => {
       eq(calls.status, 'completed'),
     ));
 
-  return c.json({
+  const result = {
     agents: {
       total: Number(totalAgents),
       online: Number(onlineAgents),
@@ -77,7 +83,10 @@ router.get('/', async (c) => {
       pending: Number(pendingTodos),
     },
     wallet: walletData[0] ?? { balance: '0', currency: 'USD' },
-  });
+  };
+
+  await cacheSet(cacheKey, result, 15);
+  return c.json(result);
 });
 
 export default router;

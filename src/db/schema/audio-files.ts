@@ -14,5 +14,6 @@ export const audioFiles = pgTable('audio_files', {
   ttsText: text('tts_text'),
   ttsVoice: text('tts_voice'),
   category: text('category').default('general'),
+  fileData: text('file_data'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
 });

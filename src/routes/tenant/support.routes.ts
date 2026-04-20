@@ -10,9 +10,9 @@ const router = new Hono();
 
 const ticketSchema = z.object({
   subject: z.string().min(1),
-  description: z.string().optional(),
+  description: z.string().nullable().optional(),
   priority: z.enum(['low', 'medium', 'high', 'urgent']).default('medium'),
-  category: z.string().optional(),
+  category: z.string().nullable().optional(),
 });
 
 function generateTicketNumber() {
@@ -23,9 +23,9 @@ function generateTicketNumber() {
 router.get('/', async (c) => {
   const tenantId = c.get('tenantId')!;
   const raw = paginationSchema.extend({
-    status: z.string().optional(),
-    priority: z.string().optional(),
-  }).parse(c.req.query());
+    status: z.string().nullable().optional(),
+    priority: z.string().nullable().optional(),
+  }).passthrough().parse(c.req.query());
   const { offset, limit } = paginate(raw);
 
   const conditions: any[] = [eq(supportTickets.tenantId, tenantId)];
@@ -71,8 +71,8 @@ router.put('/:id', async (c) => {
   const body = z.object({
     status: z.enum(['open', 'in_progress', 'resolved', 'closed']).optional(),
     priority: z.enum(['low', 'medium', 'high', 'urgent']).optional(),
-    assignedTo: z.string().uuid().nullable().optional(),
-  }).parse(await c.req.json());
+    assignedTo: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
+  }).passthrough().parse(await c.req.json());
 
   const [row] = await db.update(supportTickets)
     .set({ ...body, updatedAt: new Date() })
@@ -103,7 +103,7 @@ router.get('/:id/messages', async (c) => {
     .where(eq(ticketMessages.ticketId, ticket.id))
     .orderBy(ticketMessages.createdAt);
 
-  return c.json(rows);
+  return c.json({ data: rows });
 });
 
 // Add ticket message
@@ -114,11 +114,16 @@ router.post('/:id/messages', async (c) => {
     .where(and(eq(supportTickets.id, c.req.param('id')), eq(supportTickets.tenantId, tenantId)));
   if (!ticket) throw new NotFound('Ticket not found');
 
+  const raw = await c.req.json();
+  // Frontend sends 'message', backend uses 'content'
+  if (raw.message && !raw.content) raw.content = raw.message;
+  // Frontend sends 'attachmentName', backend uses 'attachmentUrl'
+  if (raw.attachmentName && !raw.attachmentUrl) raw.attachmentUrl = raw.attachmentName;
   const body = z.object({
     content: z.string().min(1),
-    isInternal: z.boolean().default(false),
-    attachmentUrl: z.string().url().optional(),
-  }).parse(await c.req.json());
+    isInternal: z.boolean().nullable().default(false),
+    attachmentUrl: z.string().optional(),
+  }).passthrough().parse(raw);
 
   const [row] = await db.insert(ticketMessages).values({
     ticketId: ticket.id,

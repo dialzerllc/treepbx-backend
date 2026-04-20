@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { eq, and, sql, gte } from 'drizzle-orm';
 import { db } from '../../db/client';
-import { users, calls, scheduleEvents, agentSessions } from '../../db/schema';
+import { users, calls, scheduleEvents, agentSessions, agentDids, dids } from '../../db/schema';
 import { NotFound } from '../../lib/errors';
 
 const router = new Hono();
@@ -45,7 +45,13 @@ router.get('/stats/today', async (c) => {
     .from(calls)
     .where(and(eq(calls.agentId, userId), gte(calls.startedAt, today)));
 
-  return c.json(stats);
+  const avgMin = Math.floor(Number(stats.avgDuration) / 60);
+  const avgSec = Number(stats.avgDuration) % 60;
+  return c.json({
+    ...stats,
+    avgDuration: `${avgMin}m ${avgSec}s`,
+    totalTalkTime: `${Math.floor(Number(stats.totalTalkTime) / 60)}m`,
+  });
 });
 
 // GET /schedule/upcoming — next few schedule events
@@ -76,6 +82,19 @@ router.put('/status', async (c) => {
   }).where(eq(users.id, userId));
 
   return c.json({ ok: true });
+});
+
+// GET /dids — agent's assigned DIDs for caller ID selection
+router.get('/dids', async (c) => {
+  const userId = c.get('user').sub;
+  const rows = await db.select({
+    didId: agentDids.didId,
+    number: dids.number,
+    country: dids.country,
+  }).from(agentDids)
+    .innerJoin(dids, eq(agentDids.didId, dids.id))
+    .where(eq(agentDids.agentId, userId));
+  return c.json({ data: rows });
 });
 
 export default router;

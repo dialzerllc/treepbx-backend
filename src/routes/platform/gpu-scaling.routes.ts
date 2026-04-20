@@ -13,11 +13,11 @@ const ruleSchema = z.object({
   metric: z.string().min(1),
   thresholdUp: z.string(),
   thresholdDown: z.string(),
-  minInstances: z.number().int().min(0).default(1),
-  maxInstances: z.number().int().positive().default(4),
+  minInstances: z.coerce.number().int().default(1),
+  maxInstances: z.coerce.number().int().default(4),
   gpuType: z.string().min(1),
   provider: z.string().default('runpod'),
-  enabled: z.boolean().default(true),
+  enabled: z.boolean().nullable().default(true),
 });
 
 const updateSchema = ruleSchema.partial();

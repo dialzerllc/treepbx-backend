@@ -40,10 +40,17 @@ export const calls = pgTable('calls', {
   packetLossPct: numeric('packet_loss_pct', { precision: 5, scale: 2 }),
   carrier: text('carrier'),
   carrierIp: text('carrier_ip'),
+  codec: text('codec'),
+  userAgent: text('user_agent'),
+  sipFromUri: text('sip_from_uri'),
+  sipToUri: text('sip_to_uri'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
 }, (table) => [
   index('idx_calls_tenant').on(table.tenantId, table.startedAt),
   index('idx_calls_agent').on(table.agentId, table.startedAt),
   index('idx_calls_campaign').on(table.campaignId),
   index('idx_calls_uuid').on(table.freeswitchUuid),
+  index('idx_calls_status').on(table.status),
+  index('idx_calls_caller').on(table.callerId),
+  index('idx_calls_callee').on(table.calleeNumber),
 ]);

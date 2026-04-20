@@ -24,7 +24,7 @@ router.get('/agents', requireRole('tenant_admin', 'supervisor'), async (c) => {
   }).from(users)
     .where(and(
       eq(users.tenantId, tenantId),
-      inArray(users.role, ['agent', 'supervisor']),
+      inArray(users.role, ['agent', 'supervisor', 'tenant_admin']),
       isNull(users.deletedAt),
     ))
     .orderBy(users.firstName);
@@ -53,7 +53,7 @@ router.get('/agents', requireRole('tenant_admin', 'supervisor'), async (c) => {
     activeCall: callMap[a.id] ?? null,
   }));
 
-  return c.json(enriched);
+  return c.json({ data: enriched });
 });
 
 // Listen stub

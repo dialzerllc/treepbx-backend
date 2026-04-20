@@ -1,27 +1,27 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { eq, and, desc, count } from 'drizzle-orm';
+import { eq, and, desc, count, sql } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import { db } from '../../db/client';
 import { apiKeys, webhooks } from '../../db/schema';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
-import { NotFound } from '../../lib/errors';
+import { NotFound, BadRequest } from '../../lib/errors';
 import { requireRole } from '../../middleware/roles';
 
 const router = new Hono();
 
 const apiKeySchema = z.object({
   name: z.string().min(1),
-  scopes: z.array(z.string()).default([]),
-  rateLimit: z.number().int().positive().default(1000),
-  expiresAt: z.string().datetime().nullable().optional(),
+  scopes: z.array(z.string()).nullable().default([]),
+  rateLimit: z.coerce.number().int().default(1000),
+  expiresAt: z.string().nullable().optional().transform((v) => v && v.length > 5 ? v : null),
 });
 
 const webhookSchema = z.object({
   name: z.string().min(1),
   url: z.string().url(),
-  events: z.array(z.string()).default([]),
-  active: z.boolean().default(true),
+  events: z.array(z.string()).nullable().default([]),
+  active: z.boolean().nullable().default(true),
 });
 
 // List API keys
@@ -63,12 +63,15 @@ router.get('/webhooks', async (c) => {
     lastDeliveryStatus: webhooks.lastDeliveryStatus,
     createdAt: webhooks.createdAt,
   }).from(webhooks).where(eq(webhooks.tenantId, tenantId)).orderBy(desc(webhooks.createdAt));
-  return c.json(rows);
+  return c.json({ data: rows });
 });
 
 router.post('/webhooks', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const body = webhookSchema.parse(await c.req.json());
+  const [dup] = await db.select({ id: webhooks.id }).from(webhooks)
+    .where(and(eq(webhooks.name, body.name), eq(webhooks.tenantId, tenantId)));
+  if (dup) throw new BadRequest('Webhook name already exists');
   const secret = nanoid(32);
   const [row] = await db.insert(webhooks).values({ ...body, tenantId, secret }).returning();
   return c.json({ ...row, secret }, 201);
@@ -77,6 +80,11 @@ router.post('/webhooks', requireRole('tenant_admin'), async (c) => {
 router.put('/webhooks/:wid', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const body = webhookSchema.partial().parse(await c.req.json());
+  if (body.name) {
+    const [dup] = await db.select({ id: webhooks.id }).from(webhooks)
+      .where(and(eq(webhooks.name, body.name), eq(webhooks.tenantId, tenantId), sql`${webhooks.id} != ${c.req.param('wid')}`));
+    if (dup) throw new BadRequest('Webhook name already exists');
+  }
   const [row] = await db.update(webhooks).set(body)
     .where(and(eq(webhooks.id, c.req.param('wid')), eq(webhooks.tenantId, tenantId)))
     .returning();
@@ -116,6 +124,9 @@ router.post('/', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const userId = c.get('user').sub;
   const body = apiKeySchema.parse(await c.req.json());
+  const [dup] = await db.select({ id: apiKeys.id }).from(apiKeys)
+    .where(and(eq(apiKeys.name, body.name), eq(apiKeys.tenantId, tenantId)));
+  if (dup) throw new BadRequest('API key name already exists');
 
   const rawKey = `tpbx_${nanoid(32)}`;
   const keyPrefix = rawKey.slice(0, 12);
@@ -141,8 +152,13 @@ router.put('/:id', requireRole('tenant_admin'), async (c) => {
     name: z.string().min(1).optional(),
     active: z.boolean().optional(),
     scopes: z.array(z.string()).optional(),
-    rateLimit: z.number().int().positive().optional(),
-  }).parse(await c.req.json());
+    rateLimit: z.coerce.number().int().default(1).optional(),
+  }).passthrough().parse(await c.req.json());
+  if (body.name) {
+    const [dup] = await db.select({ id: apiKeys.id }).from(apiKeys)
+      .where(and(eq(apiKeys.name, body.name), eq(apiKeys.tenantId, tenantId), sql`${apiKeys.id} != ${c.req.param('id')}`));
+    if (dup) throw new BadRequest('API key name already exists');
+  }
 
   const [row] = await db.update(apiKeys).set(body)
     .where(and(eq(apiKeys.id, c.req.param('id')), eq(apiKeys.tenantId, tenantId)))

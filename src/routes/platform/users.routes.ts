@@ -1,17 +1,18 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
+import { optionalEmail } from '../../lib/zod-helpers';
 import { eq, and, like, desc, count, isNull, or } from 'drizzle-orm';
 import { db } from '../../db/client';
 import { users } from '../../db/schema';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
-import { NotFound } from '../../lib/errors';
+import { NotFound, BadRequest } from '../../lib/errors';
 import { hashPassword } from '../../lib/password';
 
 const router = new Hono();
 
 const createUserSchema = z.object({
   email: z.string().email(),
-  password: z.string().min(8),
+  password: z.string().min(1).optional(),
   firstName: z.string().min(1),
   lastName: z.string().min(1),
   role: z.enum(['super_admin', 'platform_supervisor']),
@@ -19,11 +20,11 @@ const createUserSchema = z.object({
 });
 
 const updateUserSchema = z.object({
-  email: z.string().email().optional(),
+  email: optionalEmail(),
   firstName: z.string().min(1).optional(),
   lastName: z.string().min(1).optional(),
   role: z.enum(['super_admin', 'platform_supervisor']).optional(),
-  status: z.string().optional(),
+  status: z.string().nullable().optional(),
   permissions: z.record(z.unknown()).optional(),
   password: z.string().min(8).optional(),
 });
@@ -74,14 +75,22 @@ router.get('/:id', async (c) => {
 });
 
 router.post('/', async (c) => {
-  const body = createUserSchema.parse(await c.req.json());
-  const { password, ...rest } = body;
-  const passwordHash = await hashPassword(password);
-  const [row] = await db.insert(users).values({ ...rest, passwordHash, tenantId: null }).returning({
+  const body = createUserSchema.passthrough().parse(await c.req.json());
+
+  // Check for duplicate email
+  const [existing] = await db.select({ id: users.id }).from(users).where(eq(users.email, body.email));
+  if (existing) throw new BadRequest('Email already exists');
+
+  const pw = body.password || Math.random().toString(36).slice(-12) + 'A1!';
+  const passwordHash = await hashPassword(pw);
+  const [row] = await db.insert(users).values({
+    email: body.email, firstName: body.firstName, lastName: body.lastName,
+    role: body.role, permissions: body.permissions ?? {}, passwordHash, tenantId: null,
+  }).returning({
     id: users.id, email: users.email, firstName: users.firstName, lastName: users.lastName,
     role: users.role, createdAt: users.createdAt,
   });
-  return c.json(row, 201);
+  return c.json({ ...row, tempPassword: pw }, 201);
 });
 
 router.put('/:id', async (c) => {

@@ -1,18 +1,19 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { eq, and, desc, count } from 'drizzle-orm';
+import { eq, and, desc, count, sql } from 'drizzle-orm';
 import { db } from '../../db/client';
 import { crmIntegrations } from '../../db/schema';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
-import { NotFound } from '../../lib/errors';
+import { NotFound, BadRequest } from '../../lib/errors';
 import { requireRole } from '../../middleware/roles';
 
 const router = new Hono();
 
 const crmSchema = z.object({
   name: z.string().min(1),
-  provider: z.enum(['salesforce', 'hubspot', 'zoho', 'pipedrive', 'custom']),
-  syncDirection: z.enum(['inbound', 'outbound', 'bidirectional']).default('bidirectional'),
+  provider: z.enum(['salesforce', 'hubspot', 'zoho', 'pipedrive', 'freshsales', 'custom']),
+  syncDirection: z.enum(['inbound', 'outbound', 'bidirectional', 'push', 'pull']).default('bidirectional')
+    .transform((v) => v === 'push' ? 'outbound' : v === 'pull' ? 'inbound' : v),
   status: z.enum(['active', 'inactive', 'error']).default('active'),
   credentials: z.record(z.unknown()).optional(),
   config: z.record(z.unknown()).optional(),
@@ -66,6 +67,9 @@ router.get('/:id', async (c) => {
 router.post('/', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const body = crmSchema.parse(await c.req.json());
+  const [dup] = await db.select({ id: crmIntegrations.id }).from(crmIntegrations)
+    .where(and(eq(crmIntegrations.name, body.name), eq(crmIntegrations.tenantId, tenantId)));
+  if (dup) throw new BadRequest('CRM integration name already exists');
   const [row] = await db.insert(crmIntegrations).values({ ...body, tenantId }).returning();
   return c.json(row, 201);
 });
@@ -73,6 +77,11 @@ router.post('/', requireRole('tenant_admin'), async (c) => {
 router.put('/:id', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const body = crmSchema.partial().parse(await c.req.json());
+  if (body.name) {
+    const [dup] = await db.select({ id: crmIntegrations.id }).from(crmIntegrations)
+      .where(and(eq(crmIntegrations.name, body.name), eq(crmIntegrations.tenantId, tenantId), sql`${crmIntegrations.id} != ${c.req.param('id')}`));
+    if (dup) throw new BadRequest('CRM integration name already exists');
+  }
   const [row] = await db.update(crmIntegrations).set(body)
     .where(and(eq(crmIntegrations.id, c.req.param('id')), eq(crmIntegrations.tenantId, tenantId)))
     .returning();

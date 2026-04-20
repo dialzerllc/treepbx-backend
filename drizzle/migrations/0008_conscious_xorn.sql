@@ -1,0 +1,1 @@
+ALTER TABLE "rate_cards" ADD COLUMN "billing_increment" text DEFAULT '6/6';

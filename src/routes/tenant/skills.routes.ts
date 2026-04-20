@@ -1,17 +1,17 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { eq, and, like, desc, count } from 'drizzle-orm';
+import { eq, and, like, desc, count, sql } from 'drizzle-orm';
 import { db } from '../../db/client';
 import { skills } from '../../db/schema';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
-import { NotFound } from '../../lib/errors';
+import { NotFound, BadRequest } from '../../lib/errors';
 import { requireRole } from '../../middleware/roles';
 
 const router = new Hono();
 
 const skillSchema = z.object({
   name: z.string().min(1),
-  description: z.string().optional(),
+  description: z.string().nullable().optional(),
 });
 
 router.get('/', async (c) => {
@@ -42,6 +42,9 @@ router.get('/:id', async (c) => {
 router.post('/', requireRole('tenant_admin', 'supervisor'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const body = skillSchema.parse(await c.req.json());
+  const [dup] = await db.select({ id: skills.id }).from(skills)
+    .where(and(eq(skills.name, body.name), eq(skills.tenantId, tenantId)));
+  if (dup) throw new BadRequest('Skill name already exists');
   const [row] = await db.insert(skills).values({ ...body, tenantId }).returning();
   return c.json(row, 201);
 });
@@ -49,6 +52,11 @@ router.post('/', requireRole('tenant_admin', 'supervisor'), async (c) => {
 router.put('/:id', requireRole('tenant_admin', 'supervisor'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const body = skillSchema.partial().parse(await c.req.json());
+  if (body.name) {
+    const [dup] = await db.select({ id: skills.id }).from(skills)
+      .where(and(eq(skills.name, body.name), eq(skills.tenantId, tenantId), sql`${skills.id} != ${c.req.param('id')}`));
+    if (dup) throw new BadRequest('Skill name already exists');
+  }
   const [row] = await db.update(skills).set(body)
     .where(and(eq(skills.id, c.req.param('id')), eq(skills.tenantId, tenantId)))
     .returning();

@@ -9,11 +9,17 @@ import { requireRole } from '../../middleware/roles';
 
 const router = new Hono();
 
-// Get wallet balance
+// Get wallet balance (Redis cached)
 router.get('/', async (c) => {
   const tenantId = c.get('tenantId')!;
+  const { cacheGet, cacheSet } = await import('../../lib/redis');
+  const cacheKey = `wallet:${tenantId}`;
+  const cached = await cacheGet(cacheKey);
+  if (cached) return c.json(cached);
+
   const [wallet] = await db.select().from(wallets).where(eq(wallets.tenantId, tenantId));
   if (!wallet) throw new NotFound('Wallet not found');
+  await cacheSet(cacheKey, wallet, 10);
   return c.json(wallet);
 });
 
@@ -21,8 +27,8 @@ router.get('/', async (c) => {
 router.get('/transactions', async (c) => {
   const tenantId = c.get('tenantId')!;
   const raw = paginationSchema.extend({
-    type: z.string().optional(),
-  }).parse(c.req.query());
+    type: z.string().nullable().optional(),
+  }).passthrough().parse(c.req.query());
   const { offset, limit } = paginate(raw);
 
   const conditions: any[] = [eq(transactions.tenantId, tenantId)];
@@ -34,18 +40,24 @@ router.get('/transactions', async (c) => {
     db.select({ total: count() }).from(transactions).where(where),
   ]);
 
-  return c.json(paginatedResponse(rows, Number(total), raw));
+  const data = rows.map((t) => ({
+    ...t,
+    date: t.createdAt ? new Date(t.createdAt).toISOString().slice(0, 10) : '',
+    category: t.type === 'credit' ? 'top_up' : 'calls',
+  }));
+
+  return c.json(paginatedResponse(data, Number(total), raw));
 });
 
 // Top up wallet
-router.post('/topup', requireRole('tenant_admin'), async (c) => {
+router.post('/topup', requireRole('super_admin', 'platform_supervisor', 'tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const body = z.object({
     amount: z.number().positive(),
-    description: z.string().optional(),
-    reference: z.string().optional(),
-    paymentMethod: z.string().optional(),
-  }).parse(await c.req.json());
+    description: z.string().nullable().optional(),
+    reference: z.string().nullable().optional(),
+    paymentMethod: z.string().nullable().optional(),
+  }).passthrough().parse(await c.req.json());
 
   // Use a transaction with SELECT FOR UPDATE to prevent race conditions
   const result = await db.transaction(async (tx) => {
@@ -63,7 +75,7 @@ router.post('/topup', requireRole('tenant_admin'), async (c) => {
     const [txRecord] = await tx.insert(transactions).values({
       tenantId,
       walletId: wallet.id,
-      type: 'topup',
+      type: 'credit',
       amount: String(body.amount),
       balanceAfter: String(newBalance),
       description: body.description ?? 'Manual top-up',
@@ -72,6 +84,11 @@ router.post('/topup', requireRole('tenant_admin'), async (c) => {
 
     return { wallet: updated, transaction: txRecord };
   });
+
+  // Invalidate wallet + dashboard cache
+  const { cacheDel, cacheDelPattern } = await import('../../lib/redis');
+  await cacheDel(`wallet:${tenantId}`);
+  await cacheDelPattern(`dashboard:${tenantId}*`);
 
   return c.json(result, 201);
 });

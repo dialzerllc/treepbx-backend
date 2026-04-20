@@ -7,8 +7,9 @@ export const rateCards = pgTable('rate_cards', {
   country: text('country').notNull(),
   countryCode: text('country_code').notNull(),
   direction: text('direction').notNull(),
+  billingIncrement: text('billing_increment').default('6/6'),
   ratePerMinute: numeric('rate_per_minute', { precision: 10, scale: 6 }).notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
 }, (table) => [
-  unique('uq_rate_card').on(table.rateGroupId, table.countryCode, table.direction),
+  unique('uq_rate_card').on(table.rateGroupId, table.country, table.direction),
 ]);

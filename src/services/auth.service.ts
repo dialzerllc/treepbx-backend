@@ -1,6 +1,6 @@
 import { eq } from 'drizzle-orm';
 import { db } from '../db/client';
-import { users, refreshTokens } from '../db/schema';
+import { users, refreshTokens, tenants, plans } from '../db/schema';
 import { hashPassword, verifyPassword } from '../lib/password';
 import { signAccessToken, signRefreshToken, type JWTPayload } from '../lib/jwt';
 import { Unauthorized, NotFound } from '../lib/errors';
@@ -43,6 +43,8 @@ export async function login(email: string, password: string) {
     expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
   });
 
+  const features = user.tenantId ? await getTenantFeatures(user.tenantId) : {};
+
   return {
     user: {
       id: user.id,
@@ -53,10 +55,37 @@ export async function login(email: string, password: string) {
       tenantId: user.tenantId,
       permissions: user.permissions,
       settings: user.settings,
+      sipUsername: user.sipUsername,
+      sipDomain: user.sipDomain,
+      features,
     },
     token: accessToken,
     refreshToken,
   };
+}
+
+// Map plan.features labels (human-readable) to the *_enabled flags the UI gates on.
+const PLAN_FEATURE_MAP: Record<string, string> = {
+  'BYOC': 'byoc_enabled',
+  'API Access': 'api_access',
+  'CRM Integration': 'crm_enabled',
+  'Voicebot': 'voicebot_enabled',
+  'Call Recording': 'recording_enabled',
+  'Team Chat': 'chat_enabled',
+  'Fraud Detection': 'fraud_enabled',
+};
+
+async function getTenantFeatures(tenantId: string): Promise<Record<string, unknown>> {
+  const [t] = await db.select({ planId: tenants.planId }).from(tenants).where(eq(tenants.id, tenantId)).limit(1);
+  if (!t?.planId) return {};
+  const [p] = await db.select({ features: plans.features }).from(plans).where(eq(plans.id, t.planId)).limit(1);
+  const labels = (p?.features as string[] | null) ?? [];
+  const out: Record<string, boolean> = {};
+  for (const label of labels) {
+    const flag = PLAN_FEATURE_MAP[label];
+    if (flag) out[flag] = true;
+  }
+  return out;
 }
 
 export async function getMe(userId: string) {
@@ -71,13 +100,15 @@ export async function getMe(userId: string) {
       permissions: users.permissions,
       settings: users.settings,
       status: users.status,
+      statusChangedAt: users.statusChangedAt,
     })
     .from(users)
     .where(eq(users.id, userId))
     .limit(1);
 
   if (!user) throw new NotFound('User not found');
-  return user;
+  const features = user.tenantId ? await getTenantFeatures(user.tenantId) : {};
+  return { ...user, features };
 }
 
 export async function logout(userId: string) {

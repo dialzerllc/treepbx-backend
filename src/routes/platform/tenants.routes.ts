@@ -1,8 +1,9 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { eq, and, like, desc, count, isNull, sql } from 'drizzle-orm';
+import { optionalUuid, optionalEmail } from '../../lib/zod-helpers';
+import { eq, and, like, desc, count, isNull, sql, inArray } from 'drizzle-orm';
 import { db } from '../../db/client';
-import { tenants, users, wallets, transactions } from '../../db/schema';
+import { tenants, users, wallets, transactions, plans } from '../../db/schema';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
 import { NotFound, BadRequest } from '../../lib/errors';
 import { hashPassword } from '../../lib/password';
@@ -12,9 +13,9 @@ const router = new Hono();
 const createTenantSchema = z.object({
   name: z.string().min(1),
   slug: z.string().min(1).regex(/^[a-z0-9-]+$/),
-  planId: z.string().uuid().optional(),
+  planId: optionalUuid(),
   status: z.enum(['trial', 'active', 'suspended', 'cancelled']).default('trial'),
-  billingEmail: z.string().email().optional(),
+  billingEmail: optionalEmail(),
   timezone: z.string().default('UTC'),
   country: z.string().default('US'),
   adminEmail: z.string().email(),
@@ -25,32 +26,42 @@ const createTenantSchema = z.object({
 
 const updateTenantSchema = z.object({
   name: z.string().min(1).optional(),
+  slug: z.string().nullable().optional(),
+  customerType: z.string().nullable().optional(),
+  industry: z.string().nullable().optional(),
   status: z.enum(['trial', 'active', 'suspended', 'cancelled']).optional(),
-  planId: z.string().uuid().nullable().optional(),
-  maxAgents: z.number().int().positive().optional(),
-  maxConcurrentCalls: z.number().int().positive().optional(),
-  maxDids: z.number().int().positive().optional(),
-  billingEmail: z.string().email().optional(),
-  timezone: z.string().optional(),
-  domain: z.string().optional(),
-  phone: z.string().optional(),
-  address: z.string().optional(),
-  city: z.string().optional(),
-  state: z.string().optional(),
-  country: z.string().optional(),
+  planId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
+  maxAgents: z.coerce.number().int().default(1).optional(),
+  maxConcurrentCalls: z.coerce.number().int().default(1).optional(),
+  maxDids: z.coerce.number().int().default(1).optional(),
+  billingEmail: optionalEmail(),
+  timezone: z.string().nullable().optional(),
+  domain: z.string().nullable().optional(),
+  phone: z.string().nullable().optional(),
+  address: z.string().nullable().optional(),
+  city: z.string().nullable().optional(),
+  state: z.string().nullable().optional(),
+  zip: z.string().nullable().optional(),
+  country: z.string().nullable().optional(),
   features: z.record(z.unknown()).optional(),
 });
 
 const creditSchema = z.object({
   amount: z.number().positive(),
-  description: z.string().optional(),
-  reference: z.string().optional(),
-});
+  description: z.string().nullable().optional(),
+  note: z.string().nullable().optional(),
+  reference: z.string().nullable().optional(),
+}).transform((v) => ({ ...v, description: v.description || v.note || undefined }));
 
 router.get('/', async (c) => {
+  const { cacheGet, cacheSet } = await import('../../lib/redis');
+  const cacheKey = `tenants:list`;
+  const cached = await cacheGet(cacheKey);
+  if (cached) return c.json(cached);
+
   const raw = paginationSchema.extend({
-    status: z.string().optional(),
-  }).parse(c.req.query());
+    status: z.string().nullable().optional(),
+  }).passthrough().parse(c.req.query());
   const { offset, limit } = paginate(raw);
 
   const conditions = [isNull(tenants.deletedAt)];
@@ -63,19 +74,44 @@ router.get('/', async (c) => {
     db.select({ total: count() }).from(tenants).where(where),
   ]);
 
-  return c.json(paginatedResponse(rows, Number(total), raw));
+  // Enrich with wallet balance + plan name
+  const tenantIds = rows.map((r) => r.id);
+  const planIds = rows.map((r) => r.planId).filter((id): id is string => !!id);
+  const [allWallets, allPlans] = await Promise.all([
+    tenantIds.length > 0
+      ? db.select({ tenantId: wallets.tenantId, balance: wallets.balance }).from(wallets).where(inArray(wallets.tenantId, tenantIds))
+      : Promise.resolve([]),
+    planIds.length > 0
+      ? db.select({ id: plans.id, name: plans.name }).from(plans).where(inArray(plans.id, planIds))
+      : Promise.resolve([]),
+  ]);
+  const planNameMap = Object.fromEntries(allPlans.map((p) => [p.id, p.name]));
+  const data = rows.map((r) => ({
+    ...r,
+    walletBalance: Number(allWallets.find((w) => w.tenantId === r.id)?.balance ?? 0),
+    planName: r.planId ? planNameMap[r.planId] ?? null : null,
+  }));
+
+  const result = paginatedResponse(data, Number(total), raw);
+  await cacheSet(cacheKey, result, 30);
+  return c.json(result);
 });
 
 router.get('/:id', async (c) => {
   const [row] = await db.select().from(tenants).where(and(eq(tenants.id, c.req.param('id')), isNull(tenants.deletedAt)));
   if (!row) throw new NotFound('Tenant not found');
   const [wallet] = await db.select().from(wallets).where(eq(wallets.tenantId, row.id));
-  return c.json({ ...row, wallet: wallet ?? null });
+  const [plan] = row.planId ? await db.select({ name: plans.name }).from(plans).where(eq(plans.id, row.planId)) : [];
+  return c.json({ ...row, wallet: wallet ?? null, planName: plan?.name ?? null });
 });
 
 router.post('/', async (c) => {
   const body = createTenantSchema.parse(await c.req.json());
   const { adminEmail, adminFirstName, adminLastName, adminPassword, ...tenantData } = body;
+
+  // Check for duplicate admin email
+  const [existingEmail] = await db.select({ id: users.id }).from(users).where(eq(users.email, adminEmail));
+  if (existingEmail) throw new BadRequest('Admin email already exists');
 
   const [tenant] = await db.insert(tenants).values(tenantData).returning();
 
@@ -91,6 +127,8 @@ router.post('/', async (c) => {
 
   const [wallet] = await db.insert(wallets).values({ tenantId: tenant.id }).returning();
 
+  const { cacheDelPattern } = await import('../../lib/redis');
+  await cacheDelPattern(`tenants:*`);
   return c.json({ tenant, adminUser, wallet }, 201);
 });
 
@@ -99,13 +137,31 @@ router.put('/:id', async (c) => {
   const [row] = await db.update(tenants).set({ ...body, updatedAt: new Date() })
     .where(and(eq(tenants.id, c.req.param('id')), isNull(tenants.deletedAt))).returning();
   if (!row) throw new NotFound('Tenant not found');
-  return c.json(row);
+  const [plan] = row.planId ? await db.select({ name: plans.name }).from(plans).where(eq(plans.id, row.planId)) : [];
+  const { cacheDelPattern } = await import('../../lib/redis');
+  await cacheDelPattern(`tenants:*`);
+  return c.json({ ...row, planName: plan?.name ?? null });
+});
+
+// Reset tenant admin password
+router.put('/:id/reset-password', async (c) => {
+  const tenantId = c.req.param('id');
+  const body = z.object({ password: z.string().min(8) }).parse(await c.req.json());
+  const [admin] = await db.select({ id: users.id }).from(users)
+    .where(and(eq(users.tenantId, tenantId), eq(users.role, 'tenant_admin'), isNull(users.deletedAt)))
+    .limit(1);
+  if (!admin) throw new NotFound('Tenant admin not found');
+  const passwordHash = await hashPassword(body.password);
+  await db.update(users).set({ passwordHash, updatedAt: new Date() }).where(eq(users.id, admin.id));
+  return c.json({ ok: true });
 });
 
 router.delete('/:id', async (c) => {
   const [row] = await db.update(tenants).set({ deletedAt: new Date() })
     .where(and(eq(tenants.id, c.req.param('id')), isNull(tenants.deletedAt))).returning();
   if (!row) throw new NotFound('Tenant not found');
+  const { cacheDelPattern } = await import('../../lib/redis');
+  await cacheDelPattern(`tenants:*`);
   return c.json({ ok: true });
 });
 
@@ -135,6 +191,8 @@ router.post('/:id/credit', async (c) => {
     return { wallet: updated };
   });
 
+  const { cacheDelPattern } = await import('../../lib/redis');
+  await cacheDelPattern(`tenants:*`);
   return c.json(result);
 });
 

@@ -14,6 +14,7 @@ export const dids = pgTable('dids', {
   didType: text('did_type').default('local'),
   didGroupId: uuid('did_group_id'),
   byocCarrierId: uuid('byoc_carrier_id'),
+  cnam: text('cnam'),
   active: boolean('active').default(true),
   routeType: text('route_type').default('ivr'),
   routeTargetId: uuid('route_target_id'),

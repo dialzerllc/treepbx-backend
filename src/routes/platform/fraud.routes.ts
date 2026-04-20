@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
+import { optionalUuid } from '../../lib/zod-helpers';
 import { eq, and, like, desc, count, gte, lte } from 'drizzle-orm';
 import { db } from '../../db/client';
 import { fraudKeywords, fraudAlerts } from '../../db/schema';
@@ -9,19 +10,19 @@ import { NotFound } from '../../lib/errors';
 const router = new Hono();
 
 const keywordSchema = z.object({
-  tenantId: z.string().uuid().nullable().optional(),
+  tenantId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
   keyword: z.string().min(1),
   category: z.string().min(1),
   severity: z.enum(['info', 'warning', 'critical']).default('warning'),
-  isPhrase: z.boolean().default(false),
-  isRegex: z.boolean().default(false),
-  notifyEmail: z.boolean().default(true),
-  notifySms: z.boolean().default(false),
-  notifyWebhook: z.boolean().default(false),
-  notifyInApp: z.boolean().default(true),
-  escalateToSupervisor: z.boolean().default(false),
-  autoRecordCall: z.boolean().default(false),
-  active: z.boolean().default(true),
+  isPhrase: z.boolean().nullable().default(false),
+  isRegex: z.boolean().nullable().default(false),
+  notifyEmail: z.boolean().nullable().default(true),
+  notifySms: z.boolean().nullable().default(false),
+  notifyWebhook: z.boolean().nullable().default(false),
+  notifyInApp: z.boolean().nullable().default(true),
+  escalateToSupervisor: z.boolean().nullable().default(false),
+  autoRecordCall: z.boolean().nullable().default(false),
+  active: z.boolean().nullable().default(true),
 });
 
 // Fraud Keywords CRUD
@@ -42,12 +43,12 @@ router.get('/', async (c) => {
 // Fraud Alerts — must be before /:id to avoid route shadowing
 router.get('/alerts', async (c) => {
   const raw = paginationSchema.extend({
-    tenantId: z.string().uuid().optional(),
-    status: z.string().optional(),
-    severity: z.string().optional(),
-    from: z.string().optional(),
-    to: z.string().optional(),
-  }).parse(c.req.query());
+    tenantId: optionalUuid(),
+    status: z.string().nullable().optional(),
+    severity: z.string().nullable().optional(),
+    from: z.string().nullable().optional(),
+    to: z.string().nullable().optional(),
+  }).passthrough().parse(c.req.query());
   const { offset, limit } = paginate(raw);
 
   const conditions: any[] = [];
@@ -66,19 +67,44 @@ router.get('/alerts', async (c) => {
   return c.json(paginatedResponse(rows, Number(total), raw));
 });
 
-router.put('/alerts/:id/status', async (c) => {
+// Update fraud alert (frontend sends PUT /fraud/alerts/:id with {status})
+router.put('/alerts/:id', async (c) => {
   const body = z.object({
     status: z.enum(['new', 'reviewed', 'dismissed', 'escalated']),
-    reviewedBy: z.string().uuid().optional(),
-  }).parse(await c.req.json());
+    reviewedBy: optionalUuid(),
+  }).passthrough().parse(await c.req.json());
 
+  const userId = c.get('user')?.sub;
   const [row] = await db.update(fraudAlerts).set({
     status: body.status,
-    reviewedBy: body.reviewedBy,
+    reviewedBy: body.reviewedBy || userId,
     reviewedAt: new Date(),
   }).where(eq(fraudAlerts.id, c.req.param('id'))).returning();
   if (!row) throw new NotFound('Fraud alert not found');
   return c.json(row);
+});
+
+// GET /scans — live scan data (active calls being monitored)
+router.get('/scans', async (c) => {
+  const { calls } = await import('../../db/schema');
+  const { inArray } = await import('drizzle-orm');
+
+  // Return active calls flagged for fraud monitoring
+  const rows = await db.select({
+    id: calls.id,
+    tenantId: calls.tenantId,
+    callerId: calls.callerId,
+    calleeNumber: calls.calleeNumber,
+    direction: calls.direction,
+    status: calls.status,
+    startedAt: calls.startedAt,
+    fraudFlagged: calls.fraudFlagged,
+  }).from(calls)
+    .where(inArray(calls.status, ['ringing', 'answered']))
+    .orderBy(desc(calls.startedAt))
+    .limit(100);
+
+  return c.json({ data: rows });
 });
 
 router.get('/:id', async (c) => {

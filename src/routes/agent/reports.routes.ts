@@ -66,7 +66,18 @@ router.get('/recordings', async (c) => {
     .orderBy(desc(callRecordings.createdAt))
     .limit(100);
 
-  return c.json(rows);
+  return c.json({ data: rows });
+});
+
+// GET /recordings/:id/download — download recording
+router.get('/recordings/:id/download', async (c) => {
+  const userId = c.get('user').sub;
+  const [row] = await db.select({ id: callRecordings.id, minioKey: callRecordings.minioKey })
+    .from(callRecordings)
+    .innerJoin(calls, eq(calls.id, callRecordings.callId))
+    .where(and(eq(callRecordings.id, c.req.param('id')), eq(calls.agentId, userId)));
+  if (!row) return c.json({ error: 'Recording not found' }, 404);
+  return c.json({ url: `/stream/${row.minioKey}?download=1` });
 });
 
 // GET /dispositions — own disposition breakdown
@@ -83,7 +94,7 @@ router.get('/dispositions', async (c) => {
     .where(and(eq(calls.agentId, userId), gte(calls.startedAt, today)))
     .groupBy(calls.disposition);
 
-  return c.json(rows);
+  return c.json({ data: rows });
 });
 
 export default router;

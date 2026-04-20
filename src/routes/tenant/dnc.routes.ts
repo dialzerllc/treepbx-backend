@@ -11,7 +11,7 @@ const router = new Hono();
 
 const dncSchema = z.object({
   phone: z.string().min(1),
-  reason: z.string().optional(),
+  reason: z.string().nullable().optional(),
   source: z.string().default('manual'),
 });
 
@@ -23,8 +23,8 @@ router.post('/import', requireRole('tenant_admin', 'supervisor'), async (c) => {
 router.get('/', async (c) => {
   const tenantId = c.get('tenantId')!;
   const raw = paginationSchema.extend({
-    source: z.string().optional(),
-  }).parse(c.req.query());
+    source: z.string().nullable().optional(),
+  }).passthrough().parse(c.req.query());
   const { offset, limit } = paginate(raw);
 
   const conditions: any[] = [eq(dncEntries.tenantId, tenantId)];
@@ -64,7 +64,7 @@ router.post('/', requireRole('tenant_admin', 'supervisor'), async (c) => {
 
 router.put('/:id', requireRole('tenant_admin', 'supervisor'), async (c) => {
   const tenantId = c.get('tenantId')!;
-  const body = dncSchema.partial().omit({ phone: true }).parse(await c.req.json());
+  const body = dncSchema.partial().omit({ phone: true }).passthrough().parse(await c.req.json());
   const [row] = await db.update(dncEntries).set(body)
     .where(and(eq(dncEntries.id, c.req.param('id')), eq(dncEntries.tenantId, tenantId)))
     .returning();

@@ -9,11 +9,11 @@ const router = new Hono();
 
 router.get('/', async (c) => {
   const raw = paginationSchema.extend({
-    npa: z.string().optional(),
-    nxx: z.string().optional(),
-    city: z.string().optional(),
-    state: z.string().optional(),
-    lineType: z.string().optional(),
+    npa: z.string().nullable().optional(),
+    nxx: z.string().nullable().optional(),
+    city: z.string().nullable().optional(),
+    state: z.string().nullable().optional(),
+    lineType: z.string().nullable().optional(),
   }).parse(c.req.query());
   const { offset, limit } = paginate(raw);
 

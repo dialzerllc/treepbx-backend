@@ -1,12 +1,12 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { eq, and, desc, count } from 'drizzle-orm';
+import { eq, and, desc, count, sql } from 'drizzle-orm';
 import { db } from '../../db/client';
 import {
   voicebotConfigs, kbSources, voicebotIntents, voicebotFlows, voicebotConversations,
 } from '../../db/schema';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
-import { NotFound } from '../../lib/errors';
+import { NotFound, BadRequest } from '../../lib/errors';
 import { requireRole } from '../../middleware/roles';
 
 const router = new Hono();
@@ -17,38 +17,41 @@ const configSchema = z.object({
   engineStt: z.string().default('whisper'),
   engineTts: z.string().default('piper'),
   ttsVoice: z.string().default('en-US-male'),
-  systemPrompt: z.string().optional(),
-  maxTurns: z.number().int().positive().default(10),
+  systemPrompt: z.string().nullable().optional(),
+  maxTurns: z.coerce.number().int().default(10),
   tone: z.string().default('professional'),
   language: z.string().default('en'),
   temperature: z.union([z.number(), z.string()]).transform(String).default('0.7'),
-  guardrails: z.record(z.unknown()).optional(),
+  guardrails: z.union([
+    z.record(z.unknown()),
+    z.string().transform((s) => { try { return JSON.parse(s); } catch { return {}; } }),
+  ]).optional().default({}),
 });
 
 const kbSourceSchema = z.object({
   name: z.string().min(1),
   sourceType: z.enum(['file', 'url', 'faq']),
-  sourceUrl: z.string().url().optional(),
-  minioKey: z.string().optional(),
-  question: z.string().optional(),
-  answer: z.string().optional(),
+  sourceUrl: z.string().optional().transform((v) => v && v.startsWith('http') ? v : undefined),
+  minioKey: z.string().nullable().optional(),
+  question: z.string().nullable().optional(),
+  answer: z.string().nullable().optional(),
 });
 
 const intentSchema = z.object({
   name: z.string().min(1),
-  description: z.string().optional(),
-  trainingPhrases: z.array(z.string()).default([]),
+  description: z.string().nullable().optional(),
+  trainingPhrases: z.array(z.string()).nullable().default([]),
   action: z.string().min(1),
-  responseTemplate: z.string().optional(),
-  sortOrder: z.number().int().min(0).default(0),
+  responseTemplate: z.string().nullable().optional(),
+  sortOrder: z.coerce.number().int().default(0),
 });
 
 const flowSchema = z.object({
   name: z.string().min(1),
   botMessage: z.string().min(1),
-  expectedResponses: z.array(z.string()).default([]),
-  nextFlowId: z.string().uuid().nullable().optional(),
-  stepOrder: z.number().int().min(0).default(0),
+  expectedResponses: z.array(z.string()).nullable().default([]),
+  nextFlowId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
+  stepOrder: z.coerce.number().int().default(0),
 });
 
 // List voicebot configs
@@ -77,6 +80,9 @@ router.get('/:id', async (c) => {
 router.post('/', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const body = configSchema.parse(await c.req.json());
+  const [dup] = await db.select({ id: voicebotConfigs.id }).from(voicebotConfigs)
+    .where(and(eq(voicebotConfigs.name, body.name), eq(voicebotConfigs.tenantId, tenantId)));
+  if (dup) throw new BadRequest('Voicebot config name already exists');
   const [row] = await db.insert(voicebotConfigs).values({ ...body, tenantId }).returning();
   return c.json(row, 201);
 });
@@ -84,6 +90,11 @@ router.post('/', requireRole('tenant_admin'), async (c) => {
 router.put('/:id', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const body = configSchema.partial().parse(await c.req.json());
+  if (body.name) {
+    const [dup] = await db.select({ id: voicebotConfigs.id }).from(voicebotConfigs)
+      .where(and(eq(voicebotConfigs.name, body.name), eq(voicebotConfigs.tenantId, tenantId), sql`${voicebotConfigs.id} != ${c.req.param('id')}`));
+    if (dup) throw new BadRequest('Voicebot config name already exists');
+  }
   const [row] = await db.update(voicebotConfigs).set(body)
     .where(and(eq(voicebotConfigs.id, c.req.param('id')), eq(voicebotConfigs.tenantId, tenantId)))
     .returning();
@@ -114,7 +125,7 @@ router.get('/:id/kb', async (c) => {
   await getBotOrThrow(c.req.param('id'), tenantId);
   const rows = await db.select().from(kbSources)
     .where(and(eq(kbSources.voicebotConfigId, c.req.param('id')), eq(kbSources.tenantId, tenantId)));
-  return c.json(rows);
+  return c.json({ data: rows });
 });
 
 router.post('/:id/kb', requireRole('tenant_admin'), async (c) => {
@@ -141,7 +152,7 @@ router.get('/:id/intents', async (c) => {
   await getBotOrThrow(c.req.param('id'), tenantId);
   const rows = await db.select().from(voicebotIntents)
     .where(and(eq(voicebotIntents.voicebotConfigId, c.req.param('id')), eq(voicebotIntents.tenantId, tenantId)));
-  return c.json(rows);
+  return c.json({ data: rows });
 });
 
 router.post('/:id/intents', requireRole('tenant_admin'), async (c) => {
@@ -179,7 +190,7 @@ router.get('/:id/flows', async (c) => {
   await getBotOrThrow(c.req.param('id'), tenantId);
   const rows = await db.select().from(voicebotFlows)
     .where(and(eq(voicebotFlows.voicebotConfigId, c.req.param('id')), eq(voicebotFlows.tenantId, tenantId)));
-  return c.json(rows);
+  return c.json({ data: rows });
 });
 
 router.post('/:id/flows', requireRole('tenant_admin'), async (c) => {
@@ -222,7 +233,7 @@ router.get('/:id/prompt', async (c) => {
 
 router.put('/:id/prompt', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
-  const body = z.object({ systemPrompt: z.string() }).parse(await c.req.json());
+  const body = z.object({ systemPrompt: z.string() }).passthrough().parse(await c.req.json());
   const [row] = await db.update(voicebotConfigs).set({ systemPrompt: body.systemPrompt })
     .where(and(eq(voicebotConfigs.id, c.req.param('id')), eq(voicebotConfigs.tenantId, tenantId)))
     .returning();
@@ -232,7 +243,7 @@ router.put('/:id/prompt', requireRole('tenant_admin'), async (c) => {
 
 // Test chat - placeholder
 router.post('/:id/test/chat', async (c) => {
-  const body = z.object({ message: z.string() }).parse(await c.req.json());
+  const body = z.object({ message: z.string() }).passthrough().parse(await c.req.json());
   return c.json({
     response: `[Mock bot response to: "${body.message}"]`,
     turn: 1,

@@ -1,0 +1,1 @@
+ALTER TABLE "audio_files" ADD COLUMN "file_data" text;

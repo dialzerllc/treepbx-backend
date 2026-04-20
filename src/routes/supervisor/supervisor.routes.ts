@@ -20,7 +20,7 @@ router.get('/teams', async (c) => {
     .leftJoin(queues, eq(queues.teamId, teams.id))
     .where(eq(teams.tenantId, tenantId));
 
-  return c.json(rows);
+  return c.json({ data: rows });
 });
 
 // GET /agents — all agents with live status
@@ -32,7 +32,7 @@ router.get('/agents', async (c) => {
 
   const conditions = [
     eq(users.tenantId, tenantId),
-    inArray(users.role, ['agent', 'supervisor']),
+    inArray(users.role, ['agent', 'supervisor', 'tenant_admin']),
     isNull(users.deletedAt),
   ];
   if (teamId && teamId !== 'all') conditions.push(eq(users.teamId, teamId));
@@ -68,7 +68,7 @@ router.get('/agents', async (c) => {
     avgHandleTime: statsMap.get(a.id)?.avgHandle ?? 0,
   }));
 
-  return c.json(enriched);
+  return c.json({ data: enriched });
 });
 
 // GET /calls — active calls across teams
@@ -92,7 +92,31 @@ router.get('/calls', async (c) => {
       inArray(calls.status, ['ringing', 'answered']),
     ));
 
-  return c.json(activeCalls);
+  return c.json({ data: activeCalls });
+});
+
+// GET /queue/callers — callers waiting in queues
+router.get('/queue/callers', async (c) => {
+  const tenantId = c.get('tenantId')!;
+
+  // Find calls in ringing state (waiting in queue)
+  const callers = await db.select({
+    id: calls.id,
+    callerId: calls.callerId,
+    callerName: calls.callerName,
+    calleeNumber: calls.calleeNumber,
+    status: calls.status,
+    startedAt: calls.startedAt,
+    campaignId: calls.campaignId,
+  })
+    .from(calls)
+    .where(and(
+      eq(calls.tenantId, tenantId),
+      eq(calls.status, 'ringing'),
+    ))
+    .orderBy(calls.startedAt);
+
+  return c.json({ data: callers });
 });
 
 // GET /queue/stats — queue statistics
@@ -106,7 +130,7 @@ router.get('/queue/stats', async (c) => {
     strategy: queues.strategy,
   }).from(queues).where(eq(queues.tenantId, tenantId));
 
-  return c.json(queueList.map((q) => ({
+  return c.json({ data: queueList.map((q) => ({
     ...q,
     callsWaiting: 0,
     longestWaitSeconds: 0,
@@ -114,7 +138,7 @@ router.get('/queue/stats', async (c) => {
     callsAbandoned: 0,
     avgWaitSeconds: 0,
     serviceLevel: 100,
-  })));
+  })) });
 });
 
 // POST /listen/:agentId — silent monitoring (ESL stub)

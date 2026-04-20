@@ -34,3 +34,7 @@ export function publishFraudAlert(tenantId: string, alert: unknown) {
 export function publishDashboardStats(tenantId: string, stats: unknown) {
   broadcastToRoom(`tenant:${tenantId}`, 'dashboard:stats', stats);
 }
+
+export function publishCampaignDashboard(tenantId: string) {
+  broadcastToRoom(`tenant:${tenantId}`, 'campaign:dashboard-update', { timestamp: Date.now() });
+}

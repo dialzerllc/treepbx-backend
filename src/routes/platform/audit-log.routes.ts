@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
+import { optionalUuid } from '../../lib/zod-helpers';
 import { eq, and, like, desc, count, gte, lte, or } from 'drizzle-orm';
 import { db } from '../../db/client';
 import { auditLog } from '../../db/schema';
@@ -9,12 +10,12 @@ const router = new Hono();
 
 router.get('/', async (c) => {
   const raw = paginationSchema.extend({
-    tenantId: z.string().uuid().optional(),
-    userId: z.string().uuid().optional(),
-    action: z.string().optional(),
-    resourceType: z.string().optional(),
-    from: z.string().optional(),
-    to: z.string().optional(),
+    tenantId: optionalUuid(),
+    userId: optionalUuid(),
+    action: z.string().nullable().optional(),
+    resourceType: z.string().nullable().optional(),
+    from: z.string().nullable().optional(),
+    to: z.string().nullable().optional(),
   }).parse(c.req.query());
   const { offset, limit } = paginate(raw);
 

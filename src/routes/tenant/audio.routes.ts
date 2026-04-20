@@ -1,39 +1,63 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { eq, and, like, desc, count } from 'drizzle-orm';
+import { eq, and, like, desc, count, sql } from 'drizzle-orm';
 import { db } from '../../db/client';
 import { audioFiles, businessHours } from '../../db/schema';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
-import { NotFound } from '../../lib/errors';
+import { NotFound, BadRequest } from '../../lib/errors';
 import { requireRole } from '../../middleware/roles';
+import { uploadFile, getFileUrl } from '../../integrations/minio';
 
 const router = new Hono();
 
 const audioSchema = z.object({
   name: z.string().min(1),
-  description: z.string().optional(),
-  minioKey: z.string().min(1),
-  durationSeconds: z.union([z.number(), z.string()]).transform(String).optional(),
+  description: z.string().nullable().optional(),
+  minioKey: z.string().optional(),
+  durationSeconds: z.union([z.number(), z.string()]).optional().transform((v) => v !== undefined && v !== '' ? String(v) : undefined),
   format: z.enum(['wav', 'mp3', 'ogg']).default('wav'),
-  sizeBytes: z.number().int().positive().optional(),
+  sizeBytes: z.preprocess((v) => (v === '' || v === undefined ? undefined : v), z.coerce.number().int().optional()),
   source: z.enum(['upload', 'tts', 'recording']).default('upload'),
-  ttsText: z.string().optional(),
-  ttsVoice: z.string().optional(),
+  ttsText: z.string().nullable().optional(),
+  ttsVoice: z.string().nullable().optional(),
   category: z.string().default('general'),
+  fileData: z.string().nullable().optional(),
 });
 
 const businessHoursSchema = z.object({
   name: z.string().min(1),
-  enabled: z.boolean().default(true),
-  startTime: z.string().optional(),
-  endTime: z.string().optional(),
-  days: z.array(z.string()).default([]),
+  enabled: z.boolean().nullable().default(true),
+  startTime: z.string().nullable().optional(),
+  endTime: z.string().nullable().optional(),
+  days: z.array(z.string()).nullable().default([]),
   timezone: z.string().default('America/New_York'),
-  routeType: z.string().optional(),
-  routeTargetId: z.string().uuid().nullable().optional(),
+  routeType: z.string().nullable().optional(),
+  routeTargetId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
 });
 
 // === Named routes MUST come before /:id ===
+
+// Upload file to MinIO and return the key + presigned URL
+router.post('/upload', requireRole('tenant_admin', 'supervisor'), async (c) => {
+  const tenantId = c.get('tenantId')!;
+  const body = await c.req.parseBody();
+  const file = body['file'];
+
+  if (!file || !(file instanceof File)) {
+    return c.json({ error: 'Missing "file" field in multipart form data' }, 400);
+  }
+
+  const arrayBuffer = await file.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  const ext = file.name.split('.').pop() ?? 'wav';
+  const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+  const key = `audio/${tenantId}/${Date.now()}-${safeName}`;
+
+  await uploadFile(key, buffer, file.type || `audio/${ext}`);
+  const url = await getFileUrl(key);
+
+  return c.json({ key, url, name: file.name, size: buffer.length, contentType: file.type }, 201);
+});
 
 // TTS placeholder
 router.post('/tts', requireRole('tenant_admin', 'supervisor'), async (c) => {
@@ -45,7 +69,7 @@ router.get('/after-hours', async (c) => {
   const tenantId = c.get('tenantId')!;
   const rows = await db.select().from(businessHours)
     .where(eq(businessHours.tenantId, tenantId)).orderBy(desc(businessHours.createdAt));
-  return c.json(rows);
+  return c.json({ data: rows });
 });
 
 router.post('/after-hours', requireRole('tenant_admin', 'supervisor'), async (c) => {
@@ -80,9 +104,9 @@ router.delete('/after-hours/:hid', requireRole('tenant_admin'), async (c) => {
 router.get('/', async (c) => {
   const tenantId = c.get('tenantId')!;
   const raw = paginationSchema.extend({
-    category: z.string().optional(),
-    source: z.string().optional(),
-  }).parse(c.req.query());
+    category: z.string().nullable().optional(),
+    source: z.string().nullable().optional(),
+  }).passthrough().parse(c.req.query());
   const { offset, limit } = paginate(raw);
 
   const conditions: any[] = [eq(audioFiles.tenantId, tenantId)];
@@ -107,16 +131,45 @@ router.get('/:id', async (c) => {
   return c.json(row);
 });
 
+// Play audio — returns base64 data as audio stream
+router.get('/:id/play', async (c) => {
+  const tenantId = c.get('tenantId')!;
+  const [row] = await db.select({ fileData: audioFiles.fileData, format: audioFiles.format })
+    .from(audioFiles)
+    .where(and(eq(audioFiles.id, c.req.param('id')), eq(audioFiles.tenantId, tenantId)));
+  if (!row) throw new NotFound('Audio file not found');
+  if (!row.fileData) return c.json({ error: 'No audio data available' }, 404);
+
+  const mimeMap: Record<string, string> = { wav: 'audio/wav', mp3: 'audio/mpeg', ogg: 'audio/ogg' };
+  const mime = mimeMap[row.format ?? 'wav'] ?? 'audio/wav';
+  const buffer = Buffer.from(row.fileData, 'base64');
+
+  c.header('Content-Type', mime);
+  c.header('Content-Length', String(buffer.length));
+  return c.body(buffer);
+});
+
 router.post('/', requireRole('tenant_admin', 'supervisor'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const body = audioSchema.parse(await c.req.json());
-  const [row] = await db.insert(audioFiles).values({ ...body, tenantId }).returning();
+  const [dup] = await db.select({ id: audioFiles.id }).from(audioFiles)
+    .where(and(eq(audioFiles.name, body.name), eq(audioFiles.tenantId, tenantId)));
+  if (dup) throw new BadRequest('Audio file name already exists');
+  if (!body.minioKey) {
+    body.minioKey = `audio/${tenantId}/${Date.now()}-${body.name.replace(/[^a-zA-Z0-9]/g, '_')}.${body.format ?? 'wav'}`;
+  }
+  const [row] = await db.insert(audioFiles).values({ ...body as any, tenantId }).returning();
   return c.json(row, 201);
 });
 
 router.put('/:id', requireRole('tenant_admin', 'supervisor'), async (c) => {
   const tenantId = c.get('tenantId')!;
-  const body = audioSchema.partial().omit({ minioKey: true }).parse(await c.req.json());
+  const body = audioSchema.partial().omit({ minioKey: true }).passthrough().parse(await c.req.json());
+  if (body.name) {
+    const [dup] = await db.select({ id: audioFiles.id }).from(audioFiles)
+      .where(and(eq(audioFiles.name, body.name), eq(audioFiles.tenantId, tenantId), sql`${audioFiles.id} != ${c.req.param('id')}`));
+    if (dup) throw new BadRequest('Audio file name already exists');
+  }
   const [row] = await db.update(audioFiles).set(body)
     .where(and(eq(audioFiles.id, c.req.param('id')), eq(audioFiles.tenantId, tenantId)))
     .returning();

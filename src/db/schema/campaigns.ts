@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, integer, numeric, boolean, time, timestamp, index } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, text, integer, numeric, boolean, time, timestamp, index, jsonb } from 'drizzle-orm/pg-core';
 import { tenants } from './tenants';
 import { users } from './users';
 
@@ -8,8 +8,11 @@ export const campaigns = pgTable('campaigns', {
   name: text('name').notNull(),
   status: text('status').default('draft'),
   dialMode: text('dial_mode').notNull().default('progressive'),
-  leadListId: uuid('lead_list_id'),
+  leadListId: uuid('lead_list_id'), // legacy single list
+  leadListIds: text('lead_list_ids').array().default([]),
+  leadListStrategy: text('lead_list_strategy').default('sequential'),
   didGroupId: uuid('did_group_id'),
+  callerIdRotation: text('caller_id_rotation'),
   voicebotConfigId: uuid('voicebot_config_id'),
   rateCardId: uuid('rate_card_id'),
   scriptId: uuid('script_id'),
@@ -29,6 +32,7 @@ export const campaigns = pgTable('campaigns', {
   // BYOC
   byocRouting: text('byoc_routing').default('platform'),
   byocCarrierId: uuid('byoc_carrier_id'),
+  byocCarriers: jsonb('byoc_carriers').$type<{ carrierId: string; priority: number }[]>().default([]),
   // Schedule
   scheduledStart: timestamp('scheduled_start', { withTimezone: true }),
   scheduledEnd: timestamp('scheduled_end', { withTimezone: true }),
@@ -39,6 +43,8 @@ export const campaigns = pgTable('campaigns', {
   maxCallsPerDay: integer('max_calls_per_day').default(0),
   maxAttemptsPerLead: integer('max_attempts_per_lead').default(3),
   retryDelayMinutes: integer('retry_delay_minutes').default(60),
+  retryFailedLeads: boolean('retry_failed_leads').default(true),
+  stirCertificateId: uuid('stir_certificate_id'),
   respectLeadTimezone: boolean('respect_lead_timezone').default(true),
   pauseOnHolidays: boolean('pause_on_holidays').default(true),
   // Dispositions

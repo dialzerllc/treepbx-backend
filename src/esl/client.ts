@@ -6,6 +6,7 @@ export class ESLClient extends EventEmitter {
   private socket: Socket | null = null;
   private buffer = '';
   private connected = false;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private host: string = '127.0.0.1',
@@ -32,8 +33,9 @@ export class ESLClient extends EventEmitter {
         this.connected = false;
         logger.warn('ESL connection closed');
         this.emit('disconnected');
-        // Auto-reconnect after 5s
-        setTimeout(() => this.connect().catch(() => {}), 5000);
+        // Auto-reconnect after 5s (clear previous timer first)
+        if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = setTimeout(() => this.connect().catch(() => {}), 5000);
       });
 
       this.socket.on('error', (err) => {
@@ -61,19 +63,47 @@ export class ESLClient extends EventEmitter {
   }
 
   private processBuffer() {
-    const parts = this.buffer.split('\n\n');
-    this.buffer = parts.pop() ?? '';
+    // ESL protocol: each message is headers separated by \n\n
+    // If Content-Length is present, the body follows after the \n\n separator
+    while (true) {
+      // Find the end of headers
+      const headerEnd = this.buffer.indexOf('\n\n');
+      if (headerEnd === -1) break; // need more data
 
-    for (const part of parts) {
-      const headers = this.parseHeaders(part);
+      const headerBlock = this.buffer.slice(0, headerEnd);
+      const headers = this.parseHeaders(headerBlock);
       const contentType = headers['Content-Type'];
+      const contentLength = parseInt(headers['Content-Length'] ?? '0', 10);
 
-      if (contentType === 'auth/request') {
-        this.emit('auth/request');
-      } else if (contentType === 'command/reply') {
-        this.emit('command/reply', headers['Reply-Text'] ?? '');
-      } else if (contentType === 'text/event-plain') {
-        this.emit('event', headers);
+      if (contentLength > 0) {
+        // Need to read the body after the \n\n
+        const bodyStart = headerEnd + 2;
+        const totalNeeded = bodyStart + contentLength;
+        if (this.buffer.length < totalNeeded) break; // need more data
+
+        const body = this.buffer.slice(bodyStart, totalNeeded);
+        this.buffer = this.buffer.slice(totalNeeded);
+
+        // For event-plain, the body contains the actual event headers
+        if (contentType === 'text/event-plain') {
+          const eventHeaders = this.parseHeaders(body);
+          this.emit('event', eventHeaders);
+        } else if (contentType === 'api/response') {
+          this.emit('api/response', body.trim());
+        } else if (contentType === 'command/reply') {
+          this.emit('command/reply', headers['Reply-Text'] ?? '');
+        }
+      } else {
+        // No body — consume just the headers + \n\n
+        this.buffer = this.buffer.slice(headerEnd + 2);
+
+        if (contentType === 'auth/request') {
+          this.emit('auth/request');
+        } else if (contentType === 'command/reply') {
+          this.emit('command/reply', headers['Reply-Text'] ?? '');
+        } else if (contentType === 'text/disconnect-notice') {
+          logger.warn('ESL disconnect notice received');
+        }
       }
     }
   }
@@ -90,8 +120,8 @@ export class ESLClient extends EventEmitter {
   }
 
   send(command: string): void {
-    if (!this.socket || !this.connected) {
-      logger.warn({ command }, 'ESL not connected, dropping command');
+    if (!this.socket) {
+      logger.warn({ command }, 'ESL no socket, dropping command');
       return;
     }
     this.socket.write(`${command}\n\n`);
@@ -102,6 +132,7 @@ export class ESLClient extends EventEmitter {
   }
 
   bgapi(command: string): void {
+    logger.info({ command }, '[ESL] bgapi');
     this.send(`bgapi ${command}`);
   }
 

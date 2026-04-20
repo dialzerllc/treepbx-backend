@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
+import { optionalUuid } from '../../lib/zod-helpers';
 import { eq, and, gte, lte } from 'drizzle-orm';
 import { db } from '../../db/client';
 import { scheduleEvents, followUpTodos } from '../../db/schema';
@@ -20,21 +21,21 @@ router.get('/events', async (c) => {
     .where(and(...conditions))
     .orderBy(scheduleEvents.startTime);
 
-  return c.json(events);
+  return c.json({ data: events });
 });
 
 // POST /events — create event
 const eventSchema = z.object({
   type: z.string(),
   title: z.string(),
-  description: z.string().optional(),
+  description: z.string().nullable().optional(),
   startTime: z.string().transform((s) => new Date(s)),
   endTime: z.string().transform((s) => new Date(s)),
-  leadId: z.string().uuid().optional(),
-  leadName: z.string().optional(),
-  leadPhone: z.string().optional(),
+  leadId: optionalUuid(),
+  leadName: z.string().nullable().optional(),
+  leadPhone: z.string().nullable().optional(),
   priority: z.string().default('medium'),
-  campaignId: z.string().uuid().optional(),
+  campaignId: optionalUuid(),
 });
 
 router.post('/events', async (c) => {
@@ -65,14 +66,14 @@ router.get('/todos', async (c) => {
   const todos = await db.select().from(followUpTodos)
     .where(eq(followUpTodos.agentId, userId))
     .orderBy(followUpTodos.dueDate);
-  return c.json(todos);
+  return c.json({ data: todos });
 });
 
 // POST /todos
 const todoSchema = z.object({
-  leadName: z.string().optional(),
-  leadPhone: z.string().optional(),
-  reason: z.string().optional(),
+  leadName: z.string().nullable().optional(),
+  leadPhone: z.string().nullable().optional(),
+  reason: z.string().nullable().optional(),
   priority: z.string().default('medium'),
   dueDate: z.string().transform((s) => new Date(s)),
 });
@@ -91,7 +92,25 @@ router.post('/todos', async (c) => {
   return c.json(todo, 201);
 });
 
-// PUT /todos/:id/complete
+// PUT /todos/:id — update todo (frontend sends {completed: boolean})
+router.put('/todos/:id', async (c) => {
+  const id = c.req.param('id');
+  const userId = c.get('user').sub;
+  const body = z.object({ completed: z.boolean().optional() }).passthrough().parse(await c.req.json());
+
+  const updates: any = {};
+  if (body.completed !== undefined) {
+    updates.completed = body.completed;
+    updates.completedAt = body.completed ? new Date() : null;
+  }
+
+  await db.update(followUpTodos).set(updates)
+    .where(and(eq(followUpTodos.id, id), eq(followUpTodos.agentId, userId)));
+
+  return c.json({ ok: true });
+});
+
+// PUT /todos/:id/complete (kept for backwards compatibility)
 router.put('/todos/:id/complete', async (c) => {
   const id = c.req.param('id');
   const userId = c.get('user').sub;

@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { eq, and, isNull, inArray, count, sum, sql, gte, desc } from 'drizzle-orm';
+import { eq, and, isNull, inArray, count, sum, sql, gte, desc, like } from 'drizzle-orm';
 import { db } from '../../db/client';
 import { tenants, users, calls, agentSessions, wallets } from '../../db/schema';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
@@ -37,14 +37,14 @@ router.get('/stats', async (c) => {
   });
 });
 
-router.get('/tenants', async (c) => {
+router.get('/', async (c) => {
   const raw = paginationSchema.extend({
-    status: z.string().optional(),
+    status: z.string().nullable().optional(),
   }).parse(c.req.query());
   const { offset, limit } = paginate(raw);
 
   const conditions: any[] = [isNull(tenants.deletedAt)];
-  if (raw.search) conditions.push(sql`${tenants.name} ILIKE ${'%' + raw.search + '%'}`);
+  if (raw.search) conditions.push(like(tenants.name, `%${raw.search}%`));
   if (raw.status) conditions.push(eq(tenants.status, raw.status));
   const where = and(...conditions);
 

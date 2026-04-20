@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { eq, and, or, isNull, like, desc, count } from 'drizzle-orm';
+import { eq, and, or, isNull, like, desc, count, sql } from 'drizzle-orm';
 import { db } from '../../db/client';
 import { dispositions } from '../../db/schema';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
@@ -13,20 +13,55 @@ const dispositionSchema = z.object({
   code: z.string().min(1),
   label: z.string().min(1),
   category: z.string().min(1),
-  autoDnc: z.boolean().default(false),
-  isCompleted: z.boolean().default(false),
-  requiresNote: z.boolean().default(false),
-  requiresCallback: z.boolean().default(false),
-  enabled: z.boolean().default(true),
-  sortOrder: z.number().int().min(0).default(0),
+  autoDnc: z.boolean().nullable().default(false),
+  isCompleted: z.boolean().nullable().default(false),
+  requiresNote: z.boolean().nullable().default(false),
+  requiresCallback: z.boolean().nullable().default(false),
+  enabled: z.boolean().nullable().default(true),
+  sortOrder: z.coerce.number().int().default(0),
+});
+
+// Toggle system disposition enabled/disabled for this tenant
+router.put('/system/:key/toggle', requireRole('tenant_admin'), async (c) => {
+  const tenantId = c.get('tenantId')!;
+  const key = c.req.param('key');
+  const body = z.object({ enabled: z.boolean() }).parse(await c.req.json());
+
+  // Find the system disposition by code
+  const [systemDisp] = await db.select().from(dispositions)
+    .where(and(eq(dispositions.code, key), isNull(dispositions.tenantId)));
+
+  if (!systemDisp) throw new NotFound('System disposition not found');
+
+  // Check if tenant already has an override
+  const [existing] = await db.select().from(dispositions)
+    .where(and(eq(dispositions.code, key), eq(dispositions.tenantId, tenantId)));
+
+  if (existing) {
+    const [row] = await db.update(dispositions)
+      .set({ enabled: body.enabled })
+      .where(eq(dispositions.id, existing.id))
+      .returning();
+    return c.json(row);
+  }
+
+  // Create tenant override
+  const [row] = await db.insert(dispositions).values({
+    ...systemDisp,
+    id: undefined as any,
+    tenantId,
+    enabled: body.enabled,
+    isSystem: false,
+  }).returning();
+  return c.json(row);
 });
 
 router.get('/', async (c) => {
   const tenantId = c.get('tenantId')!;
   const raw = paginationSchema.extend({
-    category: z.string().optional(),
+    category: z.string().nullable().optional(),
     enabled: z.coerce.boolean().optional(),
-  }).parse(c.req.query());
+  }).passthrough().parse(c.req.query());
   const { offset, limit } = paginate(raw);
 
   // Include system dispositions (tenantId IS NULL) and tenant's own
@@ -55,6 +90,11 @@ router.get('/:id', async (c) => {
 router.post('/', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const body = dispositionSchema.parse(await c.req.json());
+
+  const [dup] = await db.select({ id: dispositions.id }).from(dispositions)
+    .where(and(eq(dispositions.code, body.code), or(eq(dispositions.tenantId, tenantId), isNull(dispositions.tenantId))!));
+  if (dup) throw new BadRequest('Disposition already exists');
+
   const [row] = await db.insert(dispositions).values({ ...body, tenantId }).returning();
   return c.json(row, 201);
 });
@@ -69,7 +109,7 @@ router.put('/:id', requireRole('tenant_admin'), async (c) => {
 
   // System dispositions: only toggle enabled
   if (existing.isSystem) {
-    const body = z.object({ enabled: z.boolean() }).parse(await c.req.json());
+    const body = z.object({ enabled: z.boolean() }).passthrough().parse(await c.req.json());
     // For system dispositions, we upsert a tenant-level override or just update if already tenant-owned
     if (!existing.tenantId) {
       // Create a tenant copy with the same data but enabled overridden
@@ -92,6 +132,13 @@ router.put('/:id', requireRole('tenant_admin'), async (c) => {
   }
 
   const body = dispositionSchema.partial().parse(await c.req.json());
+
+  if (body.code) {
+    const [dup] = await db.select({ id: dispositions.id }).from(dispositions)
+      .where(and(eq(dispositions.code, body.code), or(eq(dispositions.tenantId, tenantId), isNull(dispositions.tenantId))!, sql`${dispositions.id} != ${id}`));
+    if (dup) throw new BadRequest('Disposition already exists');
+  }
+
   const [row] = await db.update(dispositions).set(body)
     .where(eq(dispositions.id, id)).returning();
   return c.json(row);

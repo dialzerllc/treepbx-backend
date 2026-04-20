@@ -9,13 +9,19 @@ import campaignsRouter from './campaigns.routes';
 import leadListsRouter from './lead-lists.routes';
 import leadsRouter from './leads.routes';
 import dncRouter from './dnc.routes';
+import blocklistRouter from './blocklist.routes';
 import dispositionsRouter from './dispositions.routes';
+import scriptsRouter from './scripts.routes';
 import didsRouter from './dids.routes';
 import ivrRouter from './ivr.routes';
 import audioRouter from './audio.routes';
 import voicebotRouter from './voicebot.routes';
+import stirShakenRouter from './stir-shaken.routes';
 import monitoringRouter from './monitoring.routes';
 import reportsRouter from './reports.routes';
+import metricsRouter from './metrics.routes';
+import callTraceRouter from './call-trace.routes';
+import serviceMetricTargetsRouter from './service-metric-targets.routes';
 import crmRouter from './crm.routes';
 import apiKeysRouter from './api-keys.routes';
 import walletRouter from './wallet.routes';
@@ -31,7 +37,8 @@ const tenant = new Hono();
 tenant.use('*', authMiddleware);
 
 // Base access: any tenant role can access the router; per-route role guards narrow further
-tenant.use('*', requireRole('tenant_admin', 'supervisor', 'agent'));
+// Platform roles included so super_admin/platform_supervisor can view tenant data (e.g. reports)
+tenant.use('*', requireRole('super_admin', 'platform_supervisor', 'tenant_admin', 'supervisor', 'agent'));
 
 // Dashboard
 tenant.route('/dashboard', dashboardRouter);
@@ -46,19 +53,25 @@ tenant.route('/campaigns', campaignsRouter);
 tenant.route('/lead-lists', leadListsRouter);
 tenant.route('/leads', leadsRouter);
 tenant.route('/dnc', dncRouter);
+tenant.route('/blocklist', blocklistRouter);
 tenant.route('/dispositions', dispositionsRouter);
+tenant.route('/scripts', scriptsRouter);
 
 // Telephony
 tenant.route('/dids', didsRouter);
 tenant.route('/ivr', ivrRouter);
 tenant.route('/audio', audioRouter);
 tenant.route('/voicebot', voicebotRouter);
+tenant.route('/stir-shaken', stirShakenRouter);
 
 // Monitoring (supervisor/admin — enforced inside routes)
 tenant.route('/monitoring', monitoringRouter);
 
 // Reports (supervisor/admin — enforced inside routes)
 tenant.route('/reports', reportsRouter);
+tenant.route('/metrics', metricsRouter);
+tenant.route('/call-trace', callTraceRouter);
+tenant.route('/metric-targets', serviceMetricTargetsRouter);
 
 // Integrations (admin — enforced inside routes)
 tenant.route('/crm', crmRouter);

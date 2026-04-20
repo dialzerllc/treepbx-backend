@@ -11,24 +11,24 @@ const router = new Hono();
 const eventSchema = z.object({
   type: z.string().min(1),
   title: z.string().min(1),
-  description: z.string().optional(),
-  startTime: z.string().datetime(),
-  endTime: z.string().datetime(),
-  leadId: z.string().uuid().nullable().optional(),
-  leadName: z.string().optional(),
-  leadPhone: z.string().optional(),
+  description: z.string().nullable().optional(),
+  startTime: z.string().transform((s) => new Date(s).toISOString()),
+  endTime: z.string().transform((s) => new Date(s).toISOString()),
+  leadId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
+  leadName: z.string().nullable().optional(),
+  leadPhone: z.string().nullable().optional(),
   priority: z.enum(['low', 'medium', 'high']).default('medium'),
-  campaignId: z.string().uuid().nullable().optional(),
+  campaignId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
   status: z.string().default('upcoming'),
 });
 
 const todoSchema = z.object({
-  leadId: z.string().uuid().nullable().optional(),
-  leadName: z.string().optional(),
-  leadPhone: z.string().optional(),
-  reason: z.string().optional(),
+  leadId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
+  leadName: z.string().nullable().optional(),
+  leadPhone: z.string().nullable().optional(),
+  reason: z.string().nullable().optional(),
   priority: z.enum(['low', 'medium', 'high']).default('medium'),
-  dueDate: z.string().datetime(),
+  dueDate: z.string().transform((s) => new Date(s).toISOString()),
 });
 
 // List schedule events for current user
@@ -36,11 +36,11 @@ router.get('/events', async (c) => {
   const tenantId = c.get('tenantId')!;
   const userId = c.get('user').sub;
   const raw = paginationSchema.extend({
-    from: z.string().optional(),
-    to: z.string().optional(),
-    type: z.string().optional(),
-    status: z.string().optional(),
-  }).parse(c.req.query());
+    from: z.string().nullable().optional(),
+    to: z.string().nullable().optional(),
+    type: z.string().nullable().optional(),
+    status: z.string().nullable().optional(),
+  }).passthrough().parse(c.req.query());
   const { offset, limit } = paginate(raw);
 
   const conditions: any[] = [
@@ -117,8 +117,8 @@ router.get('/todos', async (c) => {
   const userId = c.get('user').sub;
   const raw = paginationSchema.extend({
     completed: z.coerce.boolean().optional(),
-    priority: z.string().optional(),
-  }).parse(c.req.query());
+    priority: z.string().nullable().optional(),
+  }).passthrough().parse(c.req.query());
   const { offset, limit } = paginate(raw);
 
   const conditions: any[] = [
