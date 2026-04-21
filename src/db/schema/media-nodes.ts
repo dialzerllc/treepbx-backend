@@ -3,6 +3,9 @@ import { pgTable, uuid, text, integer, real, timestamp, bigint, index } from 'dr
 /**
  * A registered FreeSWITCH media node the autoscaler knows about.
  * Rows transition: provisioning → registering → active → draining → terminating → (deleted)
+ * Terminal off-path: a stale node (no heartbeat for 60s+) is flipped to 'dead'
+ * by the reaper. 'dead' is distinct from 'terminating' — the latter means the
+ * autoscaler is actively destroying it, the former means we lost contact.
  */
 export const mediaNodes = pgTable('media_nodes', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -30,7 +33,7 @@ export const mediaNodes = pgTable('media_nodes', {
  */
 export const scalingDecisions = pgTable('scaling_decisions', {
   id: uuid('id').primaryKey().defaultRandom(),
-  kind: text('kind').notNull(),             // 'provision' | 'drain' | 'destroy' | 'skip' | 'shadow'
+  kind: text('kind').notNull(),             // 'provision' | 'drain' | 'destroy' | 'skip' | 'shadow' | 'reap'
   nodeId: uuid('node_id'),                  // nullable — shadow/skip events have no node
   reason: text('reason'),
   targetCc: integer('target_cc'),
