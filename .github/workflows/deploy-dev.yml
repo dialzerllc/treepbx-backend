@@ -1,0 +1,77 @@
+name: deploy-backend-dev
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend-dev
+  cancel-in-progress: false
+
+env:
+  DEV_HOST: 87.99.129.252
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+
+  deploy:
+    needs: typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEV_DEPLOY_SSH_KEY }}" > ~/.ssh/deploy
+          chmod 600 ~/.ssh/deploy
+          ssh-keyscan -t ed25519,ecdsa,rsa "$DEV_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Sync backend source
+        run: |
+          rsync -az --delete \
+            --exclude node_modules --exclude .env --exclude keys \
+            --exclude .git --exclude dist --exclude logs --exclude '*.log' \
+            --exclude .github \
+            -e "ssh -i ~/.ssh/deploy -o StrictHostKeyChecking=accept-new" \
+            ./ tpbx@"$DEV_HOST":/opt/tpbx/backend/
+
+      - name: Install deps + migrate + restart
+        run: |
+          ssh -i ~/.ssh/deploy tpbx@"$DEV_HOST" \
+            'cd /opt/tpbx/backend && /usr/local/bin/bun install --frozen-lockfile && \
+             set -a && source /opt/tpbx/.env && set +a && /usr/local/bin/bun run db:migrate && \
+             sudo systemctl restart tpbx-backend'
+
+      - name: Smoke test
+        run: |
+          set +e
+          for i in 1 2 3 4 5 6 7 8; do
+            # Dev backend is behind Caddy's /api/* proxy; use an endpoint we expect
+            # to respond without auth. /api/v1/auth/me returns 401 (proves proxy + backend).
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 https://dev.treepbx.com/api/v1/auth/me)
+            echo "Attempt $i: HTTP $code"
+            if [[ "$code" == "401" ]]; then exit 0; fi
+            sleep 5
+          done
+          echo "Smoke test failed after 8 attempts — rolling back"
+          ssh -i ~/.ssh/deploy tpbx@"$DEV_HOST" 'sudo systemctl restart tpbx-backend'
+          exit 1
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          URL='${{ secrets.SLACK_WEBHOOK }}'
+          if [[ -z "$URL" ]]; then echo "SLACK_WEBHOOK not set; skipping notification"; exit 0; fi
+          curl -s -X POST "$URL" \
+            -H 'Content-Type: application/json' \
+            -d "{\"text\":\":construction: backend DEV deploy failed on commit ${{ github.sha }}\"}" \
+            || true
