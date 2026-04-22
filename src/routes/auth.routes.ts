@@ -99,9 +99,35 @@ auth.post('/refresh', async (c) => {
 });
 
 auth.get('/me', authMiddleware, async (c) => {
+  // Rate limit per user: 120/min. Protects DB from a stuck-client poll loop.
+  const { checkRateLimit } = await import('../lib/redis');
   const user = c.get('user');
+  const { allowed } = await checkRateLimit(`me:${user.sub}`, 120, 60);
+  if (!allowed) {
+    c.header('Retry-After', '60');
+    return c.json({ error: 'Too many requests' }, 429);
+  }
   const profile = await authService.getMe(user.sub);
   return c.json(profile);
+});
+
+// Short-lived ticket exchange for WebSocket auth. Keeps JWT out of URL query strings
+// (which Caddy / proxies log). Ticket is single-use and expires in 30 seconds.
+auth.post('/ws-ticket', authMiddleware, async (c) => {
+  const { redis } = await import('../lib/redis');
+  const user = c.get('user');
+  const buf = new Uint8Array(32);
+  crypto.getRandomValues(buf);
+  const ticket = Array.from(buf).map((b) => b.toString(16).padStart(2, '0')).join('');
+  const payload = JSON.stringify({
+    sub: user.sub,
+    role: user.role,
+    tenantId: user.tenantId ?? null,
+    email: user.email,
+    permissions: user.permissions ?? {},
+  });
+  await redis.set(`treepbx:wsticket:${ticket}`, payload, 'EX', 30);
+  return c.json({ ticket });
 });
 
 auth.put('/me', authMiddleware, async (c) => {
