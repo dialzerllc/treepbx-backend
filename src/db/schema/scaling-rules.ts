@@ -13,6 +13,10 @@ export const scalingRules = pgTable('scaling_rules', {
   maxInstances: integer('max_instances').default(10),
   cooldownSeconds: integer('cooldown_seconds').default(300),
   callsPerInstance: integer('calls_per_instance').default(0),
+  warmSpare: integer('warm_spare').default(1).notNull(),
+  priority: integer('priority').default(100).notNull(),
+  fallbackStrategy: text('fallback_strategy').default('region').notNull(),
+  fallbackLocation: text('fallback_location'),
   enabled: boolean('enabled').default(true),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
 });

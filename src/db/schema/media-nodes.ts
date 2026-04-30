@@ -35,6 +35,7 @@ export const scalingDecisions = pgTable('scaling_decisions', {
   id: uuid('id').primaryKey().defaultRandom(),
   kind: text('kind').notNull(),             // 'provision' | 'drain' | 'destroy' | 'skip' | 'shadow' | 'reap'
   nodeId: uuid('node_id'),                  // nullable — shadow/skip events have no node
+  scalingRuleId: uuid('scaling_rule_id'),   // nullable — null when no rule matched (default behaviour)
   reason: text('reason'),
   targetCc: integer('target_cc'),
   currentCc: integer('current_cc'),

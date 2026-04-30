@@ -12,11 +12,34 @@
  * they're comfortable.
  */
 
+import { asc, eq } from 'drizzle-orm';
 import { observer, type Observation } from './observer';
-import { planner, type Plan } from './planner';
+import { planner, type Plan, type PlannerRule } from './planner';
 import { reaper } from './reaper';
-import { logDecision, isEnabled, isShadow, cooldownActive } from './state';
+import {
+  logDecision, isEnabled, isShadow,
+  cooldownActive, ruleCooldownActive,
+} from './state';
+import { db } from '../db/client';
+import { scalingRules } from '../db/schema';
 import { logger } from '../lib/logger';
+
+async function loadActiveRules(): Promise<PlannerRule[]> {
+  const rows = await db.select().from(scalingRules)
+    .where(eq(scalingRules.enabled, true))
+    .orderBy(asc(scalingRules.priority));
+  return rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    serviceType: r.serviceType,
+    enabled: r.enabled ?? true,
+    priority: r.priority,
+    minInstances: r.minInstances,
+    maxInstances: r.maxInstances,
+    callsPerInstance: r.callsPerInstance,
+    cooldownSeconds: r.cooldownSeconds,
+  }));
+}
 
 export async function runAutoscalerTick(): Promise<void> {
   if (!(await isEnabled())) return;
@@ -32,11 +55,6 @@ export async function runAutoscalerTick(): Promise<void> {
     logger.error({ err }, '[autoscaler] reaper failed');
   }
 
-  if (await cooldownActive()) {
-    await logDecision({ kind: 'skip', reason: 'cooldown', shadow });
-    return;
-  }
-
   let obs: Observation;
   try {
     obs = await observer();
@@ -46,12 +64,30 @@ export async function runAutoscalerTick(): Promise<void> {
     return;
   }
 
-  const plan: Plan = planner(obs);
+  const rules = await loadActiveRules();
+  const plan: Plan = planner(obs, rules);
+
+  // Cooldown — per-rule when a rule matched, otherwise the global default.
+  const cooldown = plan.matchedRule
+    ? await ruleCooldownActive(plan.matchedRule.id, plan.matchedRule.cooldownSeconds)
+    : await cooldownActive();
+
+  if (cooldown) {
+    const tag = plan.matchedRule ? `rule ${plan.matchedRule.name}` : 'default';
+    await logDecision({
+      kind: 'skip',
+      reason: `cooldown (${tag})`,
+      scalingRuleId: plan.matchedRule?.id ?? null,
+      shadow,
+    });
+    return;
+  }
 
   if (shadow) {
     await logDecision({
       kind: 'shadow',
       reason: plan.summary,
+      scalingRuleId: plan.matchedRule?.id ?? null,
       targetCc: obs.targetCc,
       currentCc: obs.activeCc,
       carrierCeiling: obs.carrierCeiling,
@@ -68,6 +104,7 @@ export async function runAutoscalerTick(): Promise<void> {
   await logDecision({
     kind: 'skip',
     reason: 'executor_not_wired',
+    scalingRuleId: plan.matchedRule?.id ?? null,
     targetCc: obs.targetCc,
     currentCc: obs.activeCc,
     carrierCeiling: obs.carrierCeiling,
