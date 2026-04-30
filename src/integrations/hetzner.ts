@@ -23,6 +23,31 @@ export async function listServers() {
   return hetznerFetch('/servers');
 }
 
+/**
+ * Returns Hetzner's server-type catalog. Each entry has { id, name }; we use
+ * this to map the numeric IDs in `datacenters[].server_types.available` back
+ * to slugs like 'ccx23' that the rest of the codebase uses.
+ */
+export async function listServerTypes(): Promise<{ server_types: Array<{ id: number; name: string }> }> {
+  return hetznerFetch('/server_types?per_page=50');
+}
+
+/**
+ * Returns datacenters with stock info under `server_types.available[]` (numeric
+ * IDs of types currently orderable in that DC) and `supported[]` (anything ever
+ * available there). Used for stock-aware fallback decisions.
+ */
+export async function listDatacenters(): Promise<{
+  datacenters: Array<{
+    id: number;
+    name: string;            // e.g. 'fsn1-dc14'
+    location: { id: number; name: string };  // e.g. { name: 'fsn1' }
+    server_types: { supported: number[]; available: number[]; available_for_migration: number[] };
+  }>;
+}> {
+  return hetznerFetch('/datacenters');
+}
+
 export async function createServer(name: string, serverType: string, location: string, userData?: string) {
   return hetznerFetch('/servers', {
     method: 'POST',

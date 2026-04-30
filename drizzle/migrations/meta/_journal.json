@@ -99,6 +99,13 @@
       "when": 1776204053420,
       "tag": "0013_confused_adam_warlock",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1776204153420,
+      "tag": "0014_scaling_rules_priority_fallback",
+      "breakpoints": true
     }
   ]
 }
