@@ -20,13 +20,22 @@ const router = new Hono();
  * GET /platform/autoscaler/fleet
  * Merges live Hetzner servers with our media_nodes state so the UI can see
  * both sides (what Hetzner has provisioned vs what our autoscaler tracks).
+ *
+ * Excludes the control plane and dev workstations, which share the Hetzner
+ * project but are not autoscaler-managed. Filtered by Hetzner label
+ * `role` ∈ {control-plane, developer-workstation} OR `env=dev`.
  */
 router.get('/fleet', async (c) => {
   let hetznerServers: any[] = [];
   let hetznerError: string | null = null;
   try {
     const res = await listServers();
-    hetznerServers = res?.servers ?? [];
+    hetznerServers = (res?.servers ?? []).filter((s: any) => {
+      const labels = s?.labels ?? {};
+      if (labels.role === 'control-plane' || labels.role === 'developer-workstation') return false;
+      if (labels.env === 'dev') return false;
+      return true;
+    });
   } catch (err: any) {
     hetznerError = err?.message ?? String(err);
     logger.warn({ err }, '[autoscaler.routes] Hetzner listServers failed');
