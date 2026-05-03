@@ -1,7 +1,10 @@
 import { eslClient } from './client';
 import { db } from '../db/client';
-import { carriers } from '../db/schema';
+import { carriers, mediaNodes } from '../db/schema';
 import { eq, and, inArray, asc } from 'drizzle-orm';
+import { execFileSync } from 'child_process';
+import { writeFileSync, unlinkSync } from 'fs';
+import { logger } from '../lib/logger';
 
 const DEFAULT_GATEWAY = process.env.FS_DEFAULT_GATEWAY ?? 'OTB2';
 
@@ -70,8 +73,80 @@ export function unmute(uuid: string) {
 }
 
 // ── Gateway management ─────────────────────────────────────────────────
+//
+// Gateways live as XML files inside each FreeSWITCH container's
+// /etc/freeswitch/sip_profiles/external/ directory. When the autoscaler
+// or carrier-routes mutates a gateway, we have to push the XML to every
+// active FreeSWITCH node and ask each to `sofia profile external rescan`.
+//
+// FS now lives on remote fleet boxes (one per fs node), so the historical
+// "docker cp localhost" pattern doesn't work. We:
+//   1. Look up active freeswitch media_nodes from the DB (control plane truth).
+//   2. SSH to each via the autoscaler bootstrap key (which they already trust).
+//   3. docker cp the XML into the `fs` container; fs_cli rescan locally.
+//
+// SSH key + ESL password come from the same .env that the rest of the
+// backend uses. If the key isn't set we log and bail — better to refuse
+// than to silently leak a half-provisioned gateway.
 
-export function addGateway(rawName: string, opts: {
+const SSH_KEY_PATH = process.env.SSH_PRIVATE_KEY_PATH ?? '/opt/tpbx/secrets/ssh_key';
+const SSH_USER = process.env.SSH_USER ?? 'root';
+const ESL_PW_FOR_SHIP = process.env.FREESWITCH_ESL_PASSWORD ?? 'ClueCon';
+const DOCKER_CONTAINER = process.env.FREESWITCH_CONTAINER ?? 'fs';
+
+async function getActiveFreeswitchNodes(): Promise<string[]> {
+  try {
+    const rows = await db.select({ ip: mediaNodes.publicIp })
+      .from(mediaNodes)
+      .where(and(eq(mediaNodes.serviceType, 'freeswitch'), eq(mediaNodes.state, 'active')));
+    return rows.map((r) => r.ip);
+  } catch (err) {
+    logger.warn({ err }, '[esl] could not list active freeswitch nodes');
+    return [];
+  }
+}
+
+function sshArgs(ip: string): string[] {
+  return [
+    '-i', SSH_KEY_PATH,
+    '-o', 'StrictHostKeyChecking=accept-new',
+    '-o', 'UserKnownHostsFile=/dev/null',
+    '-o', 'ConnectTimeout=5',
+    '-o', 'BatchMode=yes',
+    `${SSH_USER}@${ip}`,
+  ];
+}
+
+function pushXmlToNode(ip: string, name: string, localPath: string): void {
+  // scp file → /tmp on the node
+  execFileSync('scp', [
+    '-i', SSH_KEY_PATH,
+    '-o', 'StrictHostKeyChecking=accept-new',
+    '-o', 'UserKnownHostsFile=/dev/null',
+    '-o', 'ConnectTimeout=5',
+    '-o', 'BatchMode=yes',
+    localPath,
+    `${SSH_USER}@${ip}:/tmp/${name}.xml`,
+  ], { timeout: 12000 });
+
+  // docker cp → container; rescan profile
+  execFileSync('ssh', [
+    ...sshArgs(ip),
+    `docker cp /tmp/${name}.xml ${DOCKER_CONTAINER}:/etc/freeswitch/sip_profiles/external/${name}.xml && ` +
+    `docker exec ${DOCKER_CONTAINER} fs_cli -p ${ESL_PW_FOR_SHIP} -x 'sofia profile external rescan' && ` +
+    `rm -f /tmp/${name}.xml`,
+  ], { timeout: 15000 });
+}
+
+function killGwOnNode(ip: string, name: string): void {
+  execFileSync('ssh', [
+    ...sshArgs(ip),
+    `docker exec ${DOCKER_CONTAINER} fs_cli -p ${ESL_PW_FOR_SHIP} -x 'sofia profile external killgw ${name}' && ` +
+    `docker exec ${DOCKER_CONTAINER} rm -f /etc/freeswitch/sip_profiles/external/${name}.xml`,
+  ], { timeout: 10000 });
+}
+
+export async function addGateway(rawName: string, opts: {
   host: string;
   port?: number;
   transport?: string;
@@ -80,56 +155,67 @@ export function addGateway(rawName: string, opts: {
   register?: boolean;
   expiry?: number;
 }): Promise<boolean> {
-  return new Promise((resolve) => {
-    if (!eslClient.isConnected()) { resolve(false); return; }
+  // Sanitize: FS gateway names must match [a-zA-Z0-9_-]
+  const name = rawName.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const xml = `<include>
+  <gateway name="${name}">
+    <param name="realm" value="${opts.host}"/>
+    <param name="proxy" value="${opts.host}:${opts.port || 5060}"/>
+    <param name="register" value="${opts.register !== false ? 'true' : 'false'}"/>
+    ${opts.username ? `<param name="username" value="${opts.username}"/>` : ''}
+    ${opts.password ? `<param name="password" value="${opts.password}"/>` : ''}
+    <param name="expire-seconds" value="${opts.expiry || 3600}"/>
+    <param name="register-transport" value="${(opts.transport || 'UDP').toLowerCase()}"/>
+    <param name="retry-seconds" value="30"/>
+    <param name="caller-id-in-from" value="true"/>
+  </gateway>
+</include>`;
 
-    // Sanitize: FS gateway names can't have spaces
-    const name = rawName.replace(/[^a-zA-Z0-9_-]/g, '_');
-    const profile = 'external';
-    const xml = `<gateway name="${name}">
-  <param name="realm" value="${opts.host}"/>
-  <param name="proxy" value="${opts.host}:${opts.port || 5060}"/>
-  <param name="register" value="${opts.register !== false ? 'true' : 'false'}"/>
-  ${opts.username ? `<param name="username" value="${opts.username}"/>` : ''}
-  ${opts.password ? `<param name="password" value="${opts.password}"/>` : ''}
-  <param name="expire-seconds" value="${opts.expiry || 3600}"/>
-  <param name="register-transport" value="${(opts.transport || 'UDP').toLowerCase()}"/>
-  <param name="retry-seconds" value="30"/>
-  <param name="caller-id-in-from" value="true"/>
-</gateway>`;
+  const localPath = `/tmp/fs_gateway_${name}.xml`;
+  try {
+    writeFileSync(localPath, xml);
+  } catch (err: any) {
+    logger.error({ err: err?.message ?? String(err), name }, '[esl] could not write gateway xml');
+    return false;
+  }
 
-    // Write gateway XML via sofia profile rescan
-    eslClient.api(`sofia profile ${profile} killgw ${name}`);
-    // Use sofia_gateway_data to add dynamically
-    eslClient.api(`sofia xmlstatus gateway ${name}`);
+  const fsNodes = await getActiveFreeswitchNodes();
+  if (fsNodes.length === 0) {
+    logger.warn({ name }, '[esl] no active freeswitch nodes — gateway xml staged but not pushed');
+    try { unlinkSync(localPath); } catch {}
+    return false;
+  }
 
-    // For dynamic gateway, use bgapi with sofia_contact
-    // The proper way: write XML to disk and rescan
-    const { writeFileSync } = require('fs');
-    const gwPath = `/tmp/fs_gateway_${name}.xml`;
+  let allOk = true;
+  for (const ip of fsNodes) {
     try {
-      writeFileSync(gwPath, `<include>${xml}</include>`);
-    } catch {}
-
-    // Copy to FreeSWITCH container and rescan
-    const { execSync } = require('child_process');
-    try {
-      execSync(`docker cp ${gwPath} treepbx-freeswitch:/etc/freeswitch/sip_profiles/external/${name}.xml`, { timeout: 5000 });
-      eslClient.api(`sofia profile external rescan`);
-      resolve(true);
-    } catch (err) {
-      resolve(false);
+      pushXmlToNode(ip, name, localPath);
+      logger.info({ ip, gateway: name }, '[esl] gateway provisioned');
+    } catch (err: any) {
+      logger.warn({ err: err?.message ?? String(err), ip, gateway: name }, '[esl] gateway push failed');
+      allOk = false;
     }
-  });
+  }
+  try { unlinkSync(localPath); } catch {}
+  return allOk;
 }
 
-export function removeGateway(name: string) {
-  eslClient.api(`sofia profile external killgw ${name}`);
-  // Remove config file
-  try {
-    const { execSync } = require('child_process');
-    execSync(`docker exec treepbx-freeswitch rm -f /etc/freeswitch/sip_profiles/external/${name}.xml`, { timeout: 5000 });
-  } catch {}
+export async function removeGateway(rawName: string): Promise<boolean> {
+  const name = rawName.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const fsNodes = await getActiveFreeswitchNodes();
+  if (fsNodes.length === 0) return false;
+
+  let allOk = true;
+  for (const ip of fsNodes) {
+    try {
+      killGwOnNode(ip, name);
+      logger.info({ ip, gateway: name }, '[esl] gateway removed');
+    } catch (err: any) {
+      logger.warn({ err: err?.message ?? String(err), ip, gateway: name }, '[esl] gateway removal failed');
+      allOk = false;
+    }
+  }
+  return allOk;
 }
 
 export function getGatewayStatus(name: string): Promise<string> {

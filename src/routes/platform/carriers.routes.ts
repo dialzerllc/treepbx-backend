@@ -90,7 +90,7 @@ router.put('/:id', async (c) => {
     try {
       const { addGateway, removeGateway } = await import('../../esl/commands');
       if (row.status === 'inactive') {
-        removeGateway(row.name);
+        await removeGateway(row.name);
         await db.update(carriers).set({ registrationStatus: 'unregistered' }).where(eq(carriers.id, row.id));
       } else if (row.registrationUser) {
         const ok = await addGateway(row.name, {
@@ -115,7 +115,7 @@ router.delete('/:id', async (c) => {
   // Remove FreeSWITCH gateway
   try {
     const { removeGateway } = await import('../../esl/commands');
-    removeGateway(row.name);
+    await removeGateway(row.name);
   } catch {}
 
   return c.json({ ok: true });
