@@ -8,6 +8,7 @@ const auth = new Hono();
 const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1),
+  totpCode: z.string().regex(/^\d{6}$/).optional(),
 });
 
 auth.post('/login', async (c) => {
@@ -21,8 +22,10 @@ auth.post('/login', async (c) => {
     return c.json({ error: 'Too many login attempts. Try again in 5 minutes.' }, 429);
   }
 
-  const result = await authService.login(body.email, body.password);
+  const result = await authService.login(body.email, body.password, body.totpCode);
   c.header('X-RateLimit-Remaining', String(remaining));
+  // 2FA challenge response — frontend should prompt for the code and POST again with totpCode
+  if ('requires2FA' in result) return c.json(result, 200);
   return c.json(result);
 });
 
@@ -128,6 +131,62 @@ auth.post('/ws-ticket', authMiddleware, async (c) => {
   });
   await redis.set(`treepbx:wsticket:${ticket}`, payload, 'EX', 30);
   return c.json({ ticket });
+});
+
+/**
+ * 2FA setup flow:
+ *   POST /auth/2fa/setup    → returns { secret, otpauthUrl }; secret is staged on the user row
+ *                              but `totp_enabled` stays false until /verify confirms a code.
+ *   POST /auth/2fa/verify   → { code } — flips totp_enabled true on success.
+ *   POST /auth/2fa/disable  → { code } — verifies a current code, then clears the secret.
+ */
+auth.post('/2fa/setup', authMiddleware, async (c) => {
+  const { db } = await import('../db/client');
+  const { users } = await import('../db/schema');
+  const { eq } = await import('drizzle-orm');
+  const { generateBase32Secret, buildOtpauthUrl } = await import('../lib/totp');
+  const u = c.get('user');
+  const secret = generateBase32Secret();
+  await db.update(users).set({ totpSecret: secret, totpEnabled: false }).where(eq(users.id, u.sub));
+  const otpauthUrl = buildOtpauthUrl({ issuer: 'TreePBX', accountName: u.email, secret });
+  return c.json({ secret, otpauthUrl });
+});
+
+auth.post('/2fa/verify', authMiddleware, async (c) => {
+  const { db } = await import('../db/client');
+  const { users } = await import('../db/schema');
+  const { eq } = await import('drizzle-orm');
+  const { verifyTotp } = await import('../lib/totp');
+  const body = z.object({ code: z.string().regex(/^\d{6}$/) }).parse(await c.req.json());
+  const u = c.get('user');
+  const [row] = await db.select({ totpSecret: users.totpSecret }).from(users).where(eq(users.id, u.sub));
+  if (!row?.totpSecret) return c.json({ error: 'No pending 2FA setup. POST /2fa/setup first.' }, 400);
+  if (!verifyTotp(row.totpSecret, body.code)) return c.json({ error: 'Invalid code' }, 400);
+  await db.update(users).set({ totpEnabled: true }).where(eq(users.id, u.sub));
+  return c.json({ ok: true, enabled: true });
+});
+
+auth.post('/2fa/disable', authMiddleware, async (c) => {
+  const { db } = await import('../db/client');
+  const { users } = await import('../db/schema');
+  const { eq } = await import('drizzle-orm');
+  const { verifyTotp } = await import('../lib/totp');
+  const body = z.object({ code: z.string().regex(/^\d{6}$/) }).parse(await c.req.json());
+  const u = c.get('user');
+  const [row] = await db.select({ totpSecret: users.totpSecret, totpEnabled: users.totpEnabled }).from(users).where(eq(users.id, u.sub));
+  if (!row?.totpEnabled || !row.totpSecret) return c.json({ error: '2FA not currently enabled' }, 400);
+  if (!verifyTotp(row.totpSecret, body.code)) return c.json({ error: 'Invalid code' }, 400);
+  await db.update(users).set({ totpSecret: null, totpEnabled: false }).where(eq(users.id, u.sub));
+  return c.json({ ok: true, enabled: false });
+});
+
+auth.get('/2fa/status', authMiddleware, async (c) => {
+  const { db } = await import('../db/client');
+  const { users } = await import('../db/schema');
+  const { eq } = await import('drizzle-orm');
+  const u = c.get('user');
+  const [row] = await db.select({ totpEnabled: users.totpEnabled }).from(users).where(eq(users.id, u.sub));
+  return c.json({ enabled: !!row?.totpEnabled });
 });
 
 auth.put('/me', authMiddleware, async (c) => {
