@@ -82,3 +82,6 @@ export * from './contact-submissions';
 
 // Autoscaler / media fleet
 export * from './media-nodes';
+
+// Platform security
+export * from './platform-ip-whitelist';
