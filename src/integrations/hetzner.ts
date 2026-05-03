@@ -48,7 +48,30 @@ export async function listDatacenters(): Promise<{
   return hetznerFetch('/datacenters');
 }
 
+/**
+ * SSH keys with label `purpose=fleet-bootstrap` are attached to every new
+ * server so the control plane (and any operator with that key) can SSH into
+ * the freshly-provisioned node before user_data finishes. Cached at module
+ * load — restart the backend to pick up newly-uploaded bootstrap keys.
+ */
+let cachedFleetSshKeyIds: Promise<number[]> | null = null;
+async function getFleetSshKeyIds(): Promise<number[]> {
+  if (!cachedFleetSshKeyIds) {
+    cachedFleetSshKeyIds = (async () => {
+      try {
+        const json = await hetznerFetch('/ssh_keys?label_selector=purpose%3Dfleet-bootstrap') as { ssh_keys: Array<{ id: number }> };
+        return json.ssh_keys.map((k) => k.id);
+      } catch (err) {
+        logger.warn({ err }, '[hetzner] could not fetch fleet-bootstrap ssh keys');
+        return [];
+      }
+    })();
+  }
+  return cachedFleetSshKeyIds;
+}
+
 export async function createServer(name: string, serverType: string, location: string, userData?: string) {
+  const sshKeys = await getFleetSshKeyIds();
   return hetznerFetch('/servers', {
     method: 'POST',
     body: JSON.stringify({
@@ -57,6 +80,7 @@ export async function createServer(name: string, serverType: string, location: s
       location,
       image: 'ubuntu-22.04',
       user_data: userData,
+      ssh_keys: sshKeys,
       start_after_create: true,
     }),
   });
