@@ -5,6 +5,7 @@ import { db } from '../db/client';
 import { mediaNodes } from '../db/schema';
 import { BadRequest, Unauthorized, NotFound } from '../lib/errors';
 import { logger } from '../lib/logger';
+import { spawn } from 'child_process';
 
 const router = new Hono();
 
@@ -38,9 +39,48 @@ const registerSchema = z.object({
 });
 
 /**
+ * Detached config-bootstrap for a freshly-registered fleet node.
+ *
+ * Different roles need different config (FS external profile + dialplan, sip
+ * proxy kamailio.cfg + dispatcher list, etc). The actual logic lives in
+ * /opt/tpbx/fleet-config/<role>-bootstrap.sh — this just spawns it without
+ * blocking the /register response. Stdout/err goes into the backend log so
+ * a subsequent re-register that lifts a 'dead' row back to 'active' won't
+ * trigger another bootstrap (we only spawn on the first insert).
+ *
+ * If the script doesn't exist for a role we just skip silently — operators
+ * can SSH in and configure the box manually for now.
+ */
+function spawnBootstrap(serviceType: string, publicIp: string): void {
+  const map: Record<string, string> = {
+    freeswitch: '/opt/tpbx/fleet-config/freeswitch-bootstrap.sh',
+    // sip_proxy needs the floating IP arg too — passed via env in a future revision
+  };
+  const script = map[serviceType];
+  if (!script) return;
+  try {
+    const child = spawn(script, [publicIp], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: process.env,
+    });
+    child.stdout?.on('data', (d) => logger.info({ ip: publicIp, role: serviceType, out: d.toString().trim() }, '[bootstrap] stdout'));
+    child.stderr?.on('data', (d) => logger.warn({ ip: publicIp, role: serviceType, err: d.toString().trim() }, '[bootstrap] stderr'));
+    child.unref();
+  } catch (err: any) {
+    logger.warn({ err: err?.message ?? String(err), serviceType, publicIp }, '[bootstrap] spawn failed');
+  }
+}
+
+/**
  * Media node calls this on first boot, after cloud-init finishes.
  * Idempotent — if the node already exists (e.g. process restart), update
  * its public IP and move back to 'active'.
+ *
+ * On *first* registration of a freeswitch (or other configurable role) node,
+ * fires the role bootstrap script in the background to apply our canonical
+ * config (auth, ACL, dialplan). Re-registrations skip the bootstrap to avoid
+ * spamming a live box that's just had its agent restart.
  */
 router.post('/media-nodes/register', async (c) => {
   const body = registerSchema.parse(await c.req.json());
@@ -53,7 +93,15 @@ router.post('/media-nodes/register', async (c) => {
       state: 'active',
       lastHeartbeatAt: new Date(),
     }).where(eq(mediaNodes.id, existing.id)).returning();
-    logger.info({ nodeId: row.id, hetznerId: body.hetznerId }, '[media-nodes] re-registered');
+    logger.info({ nodeId: row.id, hetznerId: body.hetznerId, prevState: existing.state }, '[media-nodes] re-registered');
+
+    // First-time boot of an autoscaler-pre-inserted row: row was created in
+    // 'provisioning' state by executor.ts, the agent now reports 'active' for
+    // the first time. Apply role config exactly once on this transition.
+    if (existing.state === 'provisioning') {
+      spawnBootstrap(row.serviceType, body.publicIp);
+    }
+
     return c.json({ nodeId: row.id, assigned: { bootstrapToken: '***' } });
   }
 
@@ -69,6 +117,11 @@ router.post('/media-nodes/register', async (c) => {
     lastHeartbeatAt: new Date(),
   }).returning();
   logger.info({ nodeId: row.id, hetznerId: body.hetznerId, pool: body.pool }, '[media-nodes] registered');
+
+  // Fire-and-forget role bootstrap (only on first register, since 'existing' was null).
+  // We don't know serviceType from the body — read it back from the row we just wrote.
+  spawnBootstrap(row.serviceType, body.publicIp);
+
   return c.json({ nodeId: row.id }, 201);
 });
 
