@@ -62,6 +62,7 @@ async function checkHost(host: string, port: number): Promise<boolean> {
 async function reapStaleCalls() {
   try {
     const staleThreshold = new Date(Date.now() - 10 * 60 * 1000); // 10 minutes ago
+    const staleIso = staleThreshold.toISOString();
 
     // 1. Close orphaned calls (ringing/answered for > 10 min with no end)
     const staleCalls = await db.update(calls).set({
@@ -78,11 +79,14 @@ async function reapStaleCalls() {
       logger.warn({ count: staleCalls.length, ids: staleCalls.map((c) => c.id) }, '[Reaper] Closed stale calls');
     }
 
-    // 2. Release agents stuck in on_call with no active calls
+    // 2. Release agents stuck in on_call with no active calls.
+    // Pass staleThreshold as an ISO string — passing a Date here trips
+    // postgres-js's bind path with "argument must be of type string ...
+    // Received an instance of Date".
     const stuckAgents = await db.execute(sql`
       UPDATE users SET status = 'available', status_changed_at = NOW()
       WHERE status IN ('on_call', 'wrap_up')
-      AND status_changed_at < ${staleThreshold}
+      AND status_changed_at < ${staleIso}::timestamptz
       AND id NOT IN (
         SELECT agent_id FROM calls
         WHERE status IN ('ringing', 'answered')
