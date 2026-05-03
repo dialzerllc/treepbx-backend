@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, jsonb, index } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, text, timestamp, jsonb, index, boolean } from 'drizzle-orm/pg-core';
 import { tenants } from './tenants';
 import { sql } from 'drizzle-orm';
 
@@ -18,6 +18,8 @@ export const users = pgTable('users', {
   sipPasswordHash: text('sip_password_hash'),
   sipDomain: text('sip_domain'),
   settings: jsonb('settings').default({}),
+  totpSecret: text('totp_secret'),                                // base32 secret; null until 2FA enabled
+  totpEnabled: boolean('totp_enabled').default(false).notNull(),
   lastLoginAt: timestamp('last_login_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),

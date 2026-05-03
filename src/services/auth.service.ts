@@ -4,9 +4,10 @@ import { users, refreshTokens, tenants, plans } from '../db/schema';
 import { hashPassword, verifyPassword } from '../lib/password';
 import { signAccessToken, signRefreshToken, type JWTPayload } from '../lib/jwt';
 import { Unauthorized, NotFound } from '../lib/errors';
+import { verifyTotp } from '../lib/totp';
 import { nanoid } from 'nanoid';
 
-export async function login(email: string, password: string) {
+export async function login(email: string, password: string, totpCode?: string) {
   const [user] = await db
     .select()
     .from(users)
@@ -18,6 +19,16 @@ export async function login(email: string, password: string) {
 
   const valid = await verifyPassword(user.passwordHash, password);
   if (!valid) throw new Unauthorized('Invalid email or password');
+
+  // 2FA challenge — if user has TOTP enabled and no code was supplied,
+  // tell the frontend to prompt for one. The password check above acts as
+  // the gate, so this only ever runs for callers who already know the password.
+  if (user.totpEnabled && user.totpSecret) {
+    if (!totpCode) return { requires2FA: true } as const;
+    if (!verifyTotp(user.totpSecret, totpCode)) {
+      throw new Unauthorized('Invalid 2FA code');
+    }
+  }
 
   // Update last login
   await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id));
