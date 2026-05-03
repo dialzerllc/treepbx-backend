@@ -70,6 +70,8 @@ router.get('/fleet', async (c) => {
             cpuPct: node.cpuPct,
             imageVersion: node.imageVersion,
             lastHeartbeatAt: node.lastHeartbeatAt,
+            serviceType: node.serviceType,
+            location: node.location,
           }
         : null,
     };
