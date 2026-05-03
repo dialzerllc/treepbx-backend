@@ -56,19 +56,12 @@ router.get('/agents', requireRole('tenant_admin', 'supervisor'), async (c) => {
   return c.json({ data: enriched });
 });
 
-// Listen stub
-router.post('/listen/:agentId', requireRole('tenant_admin', 'supervisor'), async (c) => {
-  return c.json({ ok: true, action: 'listen', agentId: c.req.param('agentId') });
-});
-
-// Whisper stub
-router.post('/whisper/:agentId', requireRole('tenant_admin', 'supervisor'), async (c) => {
-  return c.json({ ok: true, action: 'whisper', agentId: c.req.param('agentId') });
-});
-
-// Barge stub
-router.post('/barge/:agentId', requireRole('tenant_admin', 'supervisor'), async (c) => {
-  return c.json({ ok: true, action: 'barge', agentId: c.req.param('agentId') });
-});
+// Listen / Whisper / Barge — require live FreeSWITCH ESL bridging that is not
+// wired yet. Return 501 instead of a misleading {ok:true} so the UI surfaces an
+// honest error. Frontend should hide these buttons until the ESL path is built.
+const NOT_IMPLEMENTED = { error: 'Live monitoring not yet available', code: 'NOT_IMPLEMENTED' };
+router.post('/listen/:agentId',  requireRole('tenant_admin', 'supervisor'), (c) => c.json(NOT_IMPLEMENTED, 501));
+router.post('/whisper/:agentId', requireRole('tenant_admin', 'supervisor'), (c) => c.json(NOT_IMPLEMENTED, 501));
+router.post('/barge/:agentId',   requireRole('tenant_admin', 'supervisor'), (c) => c.json(NOT_IMPLEMENTED, 501));
 
 export default router;
