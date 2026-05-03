@@ -18,6 +18,7 @@ import fraudRouter from './fraud.routes';
 import npanxxRouter from './npanxx.routes';
 import auditLogRouter from './audit-log.routes';
 import dashboardRouter from './dashboard.routes';
+import ipWhitelistRouter from './ip-whitelist.routes';
 
 const platform = new Hono();
 
@@ -40,5 +41,6 @@ platform.route('/fraud', fraudRouter);
 platform.route('/npanxx', npanxxRouter);
 platform.route('/audit-log', auditLogRouter);
 platform.route('/dashboard', dashboardRouter);
+platform.route('/ip-whitelist', ipWhitelistRouter);
 
 export default platform;
