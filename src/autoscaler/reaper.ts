@@ -33,7 +33,10 @@ export async function reaper(shadow: boolean): Promise<number> {
         or(eq(mediaNodes.state, 'active'), eq(mediaNodes.state, 'draining')),
         or(
           isNull(mediaNodes.lastHeartbeatAt),
-          lt(mediaNodes.lastHeartbeatAt, sql`now() - interval '${sql.raw(String(STALE_AFTER_SECONDS))} seconds'`),
+          // Compare against a JS Date, not raw SQL — drizzle's bind for raw
+          // intervals via sql.raw can mis-stringify and crash with
+          // "argument must be of type string ... Received an instance of Date".
+          lt(mediaNodes.lastHeartbeatAt, new Date(Date.now() - STALE_AFTER_SECONDS * 1000)),
         ),
       ),
     );
