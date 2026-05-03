@@ -52,8 +52,12 @@ const registerSchema = z.object({
  * can SSH in and configure the box manually for now.
  */
 function spawnBootstrap(serviceType: string, publicIp: string): void {
+  // Repo-relative path; the deploy rsyncs the source tree to /opt/tpbx/backend/.
+  // Override with FLEET_CONFIG_DIR if you want to keep custom-edited scripts
+  // outside the deploy footprint.
+  const dir = process.env.FLEET_CONFIG_DIR ?? '/opt/tpbx/backend/scripts/fleet-config';
   const map: Record<string, string> = {
-    freeswitch: '/opt/tpbx/fleet-config/freeswitch-bootstrap.sh',
+    freeswitch: `${dir}/freeswitch-bootstrap.sh`,
     // sip_proxy needs the floating IP arg too — passed via env in a future revision
   };
   const script = map[serviceType];
