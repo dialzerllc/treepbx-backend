@@ -87,6 +87,20 @@ router.get('/queues', async (c) => {
   return c.json({ data: rows });
 });
 
+// Delete a queue by id (scoped to tenant). Frontend's TeamsPage calls this
+// when an admin removes a queue from the queues table.
+router.delete('/queues/:id', requireRole('tenant_admin', 'supervisor'), async (c) => {
+  const tenantId = c.get('tenantId')!;
+  const queueId = c.req.param('id');
+  const [row] = await db.delete(queues)
+    .where(and(eq(queues.id, queueId), eq(queues.tenantId, tenantId)))
+    .returning();
+  if (!row) throw new NotFound('Queue not found');
+  const { cacheDelPattern } = await import('../../lib/redis');
+  await cacheDelPattern(`teams:${tenantId}*`);
+  return c.json({ ok: true });
+});
+
 // Get team with queue config
 router.get('/:id', async (c) => {
   const tenantId = c.get('tenantId')!;
