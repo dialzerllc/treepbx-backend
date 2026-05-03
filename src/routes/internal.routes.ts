@@ -80,15 +80,22 @@ const heartbeatSchema = z.object({
 /**
  * Media node calls this every ~10s with live stats. If we haven't heard from a
  * node in >60s the autoscaler treats it as dead and schedules a replacement.
+ *
+ * If the node was previously reaped to 'dead' but is now heartbeating again,
+ * lift it back to 'active'. Don't touch nodes mid-drain or mid-terminate —
+ * those transitions are owned by the autoscaler executor.
  */
 router.put('/media-nodes/:id/heartbeat', async (c) => {
   const body = heartbeatSchema.parse(await c.req.json());
+  const [current] = await db.select({ state: mediaNodes.state }).from(mediaNodes).where(eq(mediaNodes.id, c.req.param('id')));
+  if (!current) throw new NotFound('media node not registered');
+  const reviveToActive = current.state === 'dead' || current.state === 'provisioning' || current.state === 'registering';
   const [row] = await db.update(mediaNodes).set({
     activeCalls: body.activeCalls,
     cpuPct: body.cpuPct ?? null,
     lastHeartbeatAt: new Date(),
+    ...(reviveToActive ? { state: 'active' } : {}),
   }).where(eq(mediaNodes.id, c.req.param('id'))).returning();
-  if (!row) throw new NotFound('media node not registered');
   return c.json({ ok: true, state: row.state });
 });
 
