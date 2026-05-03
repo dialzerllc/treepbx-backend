@@ -412,4 +412,40 @@ router.post('/recommend', async (c) => {
   return c.json(rec);
 });
 
+/**
+ * POST /platform/autoscaler/rebootstrap
+ *
+ * Re-runs the role bootstrap script against every active fleet node, optionally
+ * filtered by serviceType. Use when:
+ *   - You added a new sip_proxy and need every fs node's ACL refreshed.
+ *   - You added a new fs node and need every sip_proxy's dispatcher.list updated.
+ *   - You changed a canonical config and want to push it without restarting.
+ *
+ * Returns immediately; bootstraps run detached. Watch the backend log to see
+ * outcomes (each spawn logs success/failure with the node IP).
+ *
+ * Body: { serviceType?: 'freeswitch'|'sip_proxy' }   // omit = both
+ */
+router.post('/rebootstrap', async (c) => {
+  const body = z.object({
+    serviceType: z.enum(['freeswitch', 'sip_proxy']).optional(),
+  }).parse(await c.req.json().catch(() => ({})));
+
+  const where = body.serviceType
+    ? and(eq(mediaNodes.serviceType, body.serviceType), eq(mediaNodes.state, 'active'))
+    : eq(mediaNodes.state, 'active');
+  const rows = await db.select().from(mediaNodes).where(where);
+
+  // Lazy-import so the route file stays free of process.spawn at top level.
+  const { spawnBootstrap } = await import('../internal.routes');
+  const dispatched: { ip: string; serviceType: string }[] = [];
+  for (const r of rows) {
+    if (r.serviceType !== 'freeswitch' && r.serviceType !== 'sip_proxy') continue;
+    spawnBootstrap(r.serviceType, r.publicIp);
+    dispatched.push({ ip: r.publicIp, serviceType: r.serviceType });
+  }
+  logger.info({ dispatched: dispatched.length, filter: body.serviceType ?? 'all' }, '[autoscaler] rebootstrap fan-out');
+  return c.json({ ok: true, dispatched });
+});
+
 export default router;

@@ -43,36 +43,58 @@ const registerSchema = z.object({
  *
  * Different roles need different config (FS external profile + dialplan, sip
  * proxy kamailio.cfg + dispatcher list, etc). The actual logic lives in
- * /opt/tpbx/fleet-config/<role>-bootstrap.sh — this just spawns it without
- * blocking the /register response. Stdout/err goes into the backend log so
- * a subsequent re-register that lifts a 'dead' row back to 'active' won't
- * trigger another bootstrap (we only spawn on the first insert).
+ * scripts/fleet-config/<role>-bootstrap.sh — this just spawns it without
+ * blocking the /register response.
+ *
+ * Retries on non-zero exit: SSH on a freshly-booted node is racy (sshd takes
+ * a few seconds to be ready, the docker daemon another few). We back off and
+ * retry up to 3 times so a transient race doesn't leave a node un-configured.
  *
  * If the script doesn't exist for a role we just skip silently — operators
  * can SSH in and configure the box manually for now.
  */
-function spawnBootstrap(serviceType: string, publicIp: string): void {
-  // Repo-relative path; the deploy rsyncs the source tree to /opt/tpbx/backend/.
-  // Override with FLEET_CONFIG_DIR if you want to keep custom-edited scripts
-  // outside the deploy footprint.
+export function spawnBootstrap(serviceType: string, publicIp: string, attempt = 1): void {
   const dir = process.env.FLEET_CONFIG_DIR ?? '/opt/tpbx/backend/scripts/fleet-config';
-  const map: Record<string, string> = {
-    freeswitch: `${dir}/freeswitch-bootstrap.sh`,
-    // sip_proxy needs the floating IP arg too — passed via env in a future revision
+  const map: Record<string, { script: string; args: string[] }> = {
+    freeswitch: { script: `${dir}/freeswitch-bootstrap.sh`, args: [publicIp] },
+    // sip_proxy: floating IP equals public_ip in this fleet (we set media_nodes.public_ip
+    // to the FIP at registration), so pass it twice — script wants <sip-ip> <floating-ip>.
+    sip_proxy:  { script: `${dir}/kamailio-bootstrap.sh`,   args: [publicIp, publicIp] },
   };
-  const script = map[serviceType];
-  if (!script) return;
+  const entry = map[serviceType];
+  if (!entry) return;
+
+  const MAX_ATTEMPTS = 3;
+  const BACKOFF_MS = [0, 30_000, 90_000];   // [retry-1, retry-2, retry-3]
+
   try {
-    const child = spawn(script, [publicIp], {
+    const child = spawn(entry.script, entry.args, {
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: process.env,
     });
-    child.stdout?.on('data', (d) => logger.info({ ip: publicIp, role: serviceType, out: d.toString().trim() }, '[bootstrap] stdout'));
-    child.stderr?.on('data', (d) => logger.warn({ ip: publicIp, role: serviceType, err: d.toString().trim() }, '[bootstrap] stderr'));
+    child.stdout?.on('data', (d) => logger.info({ ip: publicIp, role: serviceType, attempt, out: d.toString().trim() }, '[bootstrap] stdout'));
+    child.stderr?.on('data', (d) => logger.warn({ ip: publicIp, role: serviceType, attempt, err: d.toString().trim() }, '[bootstrap] stderr'));
+    child.on('exit', (code) => {
+      if (code === 0) {
+        logger.info({ ip: publicIp, role: serviceType, attempt }, '[bootstrap] success');
+        return;
+      }
+      logger.warn({ ip: publicIp, role: serviceType, attempt, exitCode: code }, '[bootstrap] failed');
+      if (attempt < MAX_ATTEMPTS) {
+        const wait = BACKOFF_MS[attempt] ?? 60_000;
+        logger.info({ ip: publicIp, role: serviceType, retryIn: wait }, '[bootstrap] scheduling retry');
+        setTimeout(() => spawnBootstrap(serviceType, publicIp, attempt + 1), wait);
+      } else {
+        logger.error({ ip: publicIp, role: serviceType }, '[bootstrap] giving up after max attempts');
+      }
+    });
     child.unref();
   } catch (err: any) {
-    logger.warn({ err: err?.message ?? String(err), serviceType, publicIp }, '[bootstrap] spawn failed');
+    logger.warn({ err: err?.message ?? String(err), serviceType, publicIp, attempt }, '[bootstrap] spawn threw');
+    if (attempt < MAX_ATTEMPTS) {
+      setTimeout(() => spawnBootstrap(serviceType, publicIp, attempt + 1), BACKOFF_MS[attempt] ?? 60_000);
+    }
   }
 }
 
