@@ -25,6 +25,14 @@ export async function getFileUrl(key: string, expiresIn = 3600): Promise<string>
   return url;
 }
 
+export async function getFileBuffer(key: string): Promise<Buffer> {
+  const res = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+  if (!res.Body) throw new Error(`MinIO object missing body: ${key}`);
+  // @ts-ignore - Body is a Readable | Blob | ReadableStream depending on runtime
+  const arrayBuf = await (res.Body as any).transformToByteArray();
+  return Buffer.from(arrayBuf);
+}
+
 // Keep old name as alias for backward compatibility
 export const getPresignedUrl = getFileUrl;
 

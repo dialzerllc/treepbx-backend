@@ -3,6 +3,7 @@ export * from './tenants';
 export * from './users';
 export * from './plans';
 export * from './audit-log';
+export * from './error-log';
 
 // Telephony
 export * from './carriers';

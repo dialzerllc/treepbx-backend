@@ -1,7 +1,7 @@
 import { eslClient } from './client';
 import { db } from '../db/client';
-import { carriers, mediaNodes } from '../db/schema';
-import { eq, and, inArray, asc } from 'drizzle-orm';
+import { carriers, mediaNodes, users, dids, agentDids } from '../db/schema';
+import { eq, and, inArray, asc, sql, isNull } from 'drizzle-orm';
 import { execFileSync } from 'child_process';
 import { writeFileSync, unlinkSync } from 'fs';
 import { logger } from '../lib/logger';
@@ -216,6 +216,293 @@ export async function removeGateway(rawName: string): Promise<boolean> {
     }
   }
   return allOk;
+}
+
+// SIP user directory provisioning — fans out an XML user file to every active
+// freeswitch node and triggers reloadxml so a new agent's softphone can
+// register. Idempotent (overwrite). Without this every newly-created agent
+// gets 403 from FS until manually added — same incident pattern as the
+// /platform/carriers→addGateway flow but for users instead of gateways.
+function pushUserXmlToNode(ip: string, sipUsername: string, localPath: string): void {
+  execFileSync('scp', [
+    '-i', SSH_KEY_PATH,
+    '-o', 'StrictHostKeyChecking=accept-new',
+    '-o', 'UserKnownHostsFile=/dev/null',
+    '-o', 'ConnectTimeout=5',
+    '-o', 'BatchMode=yes',
+    localPath,
+    `${SSH_USER}@${ip}:/tmp/${sipUsername}.xml`,
+  ], { timeout: 12000 });
+  execFileSync('ssh', [
+    ...sshArgs(ip),
+    `docker cp /tmp/${sipUsername}.xml ${DOCKER_CONTAINER}:/etc/freeswitch/directory/default/${sipUsername}.xml && ` +
+    `docker exec ${DOCKER_CONTAINER} fs_cli -p ${ESL_PW_FOR_SHIP} -x 'reloadxml' && ` +
+    `rm -f /tmp/${sipUsername}.xml`,
+  ], { timeout: 15000 });
+}
+
+function removeUserXmlOnNode(ip: string, sipUsername: string): void {
+  execFileSync('ssh', [
+    ...sshArgs(ip),
+    `docker exec ${DOCKER_CONTAINER} rm -f /etc/freeswitch/directory/default/${sipUsername}.xml && ` +
+    `docker exec ${DOCKER_CONTAINER} fs_cli -p ${ESL_PW_FOR_SHIP} -x 'reloadxml'`,
+  ], { timeout: 10000 });
+}
+
+/** Provision (or refresh) an FS directory entry for an agent. Safe to call on
+ *  every agent create/update — overwrites the file. Returns true if at least
+ *  one fs node accepted the change. */
+export async function pushSipUser(sipUsername: string): Promise<boolean> {
+  if (!/^\d{1,4}$/.test(sipUsername)) {
+    logger.warn({ sipUsername }, '[esl] invalid sip username — skipping directory push');
+    return false;
+  }
+
+  // Resolve a real outbound caller ID for this agent so softphone WSS dials
+  // present a number the carrier (and the called party) will recognise — not
+  // the internal extension. Order: agent's first assigned DID → tenant's
+  // first active DID → null (fall back to FS global ${outbound_caller_id}).
+  let outboundCallerNumber: string | null = null;
+  let displayName: string | null = null;
+  try {
+    const [agent] = await db.select({
+      id: users.id,
+      tenantId: users.tenantId,
+      firstName: users.firstName,
+      lastName: users.lastName,
+    }).from(users)
+      .where(and(eq(users.sipUsername, sipUsername), isNull(users.deletedAt)))
+      .limit(1);
+    if (agent) {
+      displayName = `${agent.firstName ?? ''} ${agent.lastName ?? ''}`.trim() || null;
+      const [assigned] = await db.select({ number: dids.number })
+        .from(agentDids)
+        .innerJoin(dids, eq(dids.id, agentDids.didId))
+        .where(and(eq(agentDids.agentId, agent.id), eq(dids.active, true)))
+        .limit(1);
+      if (assigned) outboundCallerNumber = assigned.number;
+      if (!outboundCallerNumber && agent.tenantId) {
+        const [tenantDid] = await db.select({ number: dids.number })
+          .from(dids)
+          .where(and(eq(dids.tenantId, agent.tenantId), eq(dids.active, true)))
+          .limit(1);
+        if (tenantDid) outboundCallerNumber = tenantDid.number;
+      }
+    }
+  } catch (err: any) {
+    logger.warn({ err: err?.message ?? String(err), sipUsername }, '[esl] caller-id lookup failed; using FS defaults');
+  }
+
+  const escapeXml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const cidNumber = outboundCallerNumber ?? `$\${outbound_caller_id}`;
+  const cidName = displayName ? escapeXml(displayName) : `$\${outbound_caller_name}`;
+
+  // Password references default_password (set in vars.xml at bootstrap), so
+  // rotating that one variable rolls every agent's REGISTER credential.
+  const xml = `<include>
+  <user id="${sipUsername}">
+    <params>
+      <param name="password" value="$\${default_password}"/>
+    </params>
+    <variables>
+      <variable name="user_context" value="default"/>
+      <variable name="effective_caller_id_name" value="${cidName}"/>
+      <variable name="effective_caller_id_number" value="${cidNumber}"/>
+      <variable name="outbound_caller_id_name" value="${cidName}"/>
+      <variable name="outbound_caller_id_number" value="${cidNumber}"/>
+    </variables>
+  </user>
+</include>`;
+  const localPath = `/tmp/fs_user_${sipUsername}.xml`;
+  try { writeFileSync(localPath, xml); }
+  catch (err: any) {
+    logger.error({ err: err?.message ?? String(err), sipUsername }, '[esl] could not write user xml');
+    return false;
+  }
+  const fsNodes = await getActiveFreeswitchNodes();
+  if (fsNodes.length === 0) {
+    logger.warn({ sipUsername }, '[esl] no active fs nodes — user xml staged but not pushed');
+    try { unlinkSync(localPath); } catch {}
+    return false;
+  }
+  let anyOk = false;
+  for (const ip of fsNodes) {
+    try { pushUserXmlToNode(ip, sipUsername, localPath); anyOk = true;
+      logger.info({ ip, sipUsername }, '[esl] sip user provisioned');
+    } catch (err: any) {
+      logger.warn({ err: err?.message ?? String(err), ip, sipUsername }, '[esl] sip user push failed');
+    }
+  }
+  try { unlinkSync(localPath); } catch {}
+  return anyOk;
+}
+
+/** Remove a directory entry from every fs node. Used on agent delete or when
+ *  the agent's sipUsername changes (the OLD username's file should go away). */
+export async function removeSipUser(sipUsername: string): Promise<boolean> {
+  if (!/^\d{1,4}$/.test(sipUsername)) return false;
+  const fsNodes = await getActiveFreeswitchNodes();
+  if (fsNodes.length === 0) return false;
+  let anyOk = false;
+  for (const ip of fsNodes) {
+    try { removeUserXmlOnNode(ip, sipUsername); anyOk = true;
+      logger.info({ ip, sipUsername }, '[esl] sip user removed');
+    } catch (err: any) {
+      logger.warn({ err: err?.message ?? String(err), ip, sipUsername }, '[esl] sip user removal failed');
+    }
+  }
+  return anyOk;
+}
+
+// Re-provision every directory entry under a tenant. Triggered when something
+// the user XML embeds (DID assignments, tenant DIDs) changes — without this
+// the directory entry keeps the caller-id resolved at the previous push and
+// new DIDs only take effect after the next agent edit.
+export async function repushSipUsersForTenant(tenantId: string): Promise<{ ok: number; total: number }> {
+  const rows = await db.select({ sipUsername: users.sipUsername }).from(users)
+    .where(and(eq(users.tenantId, tenantId), isNull(users.deletedAt)));
+  let ok = 0;
+  for (const r of rows) {
+    if (!r.sipUsername) continue;
+    try {
+      const pushed = await pushSipUser(r.sipUsername);
+      if (pushed) ok++;
+    } catch (err: any) {
+      logger.warn({ err: err?.message ?? String(err), sipUsername: r.sipUsername }, '[esl] tenant repush: per-user push failed');
+    }
+  }
+  logger.info({ tenantId, ok, total: rows.length }, '[esl] tenant repush complete');
+  return { ok, total: rows.length };
+}
+
+// Re-provision every directory entry across all tenants. Use sparingly — it
+// fans out to every fs node once per agent. Intended for one-off admin runs.
+export async function repushAllSipUsers(): Promise<{ ok: number; total: number }> {
+  const rows = await db.select({ sipUsername: users.sipUsername }).from(users)
+    .where(isNull(users.deletedAt));
+  let ok = 0;
+  for (const r of rows) {
+    if (!r.sipUsername) continue;
+    try {
+      if (await pushSipUser(r.sipUsername)) ok++;
+    } catch (err: any) {
+      logger.warn({ err: err?.message ?? String(err), sipUsername: r.sipUsername }, '[esl] full repush: per-user push failed');
+    }
+  }
+  logger.info({ ok, total: rows.length }, '[esl] full repush complete');
+  return { ok, total: rows.length };
+}
+
+// Regenerate the inbound DID dialplan from the database and push it to every
+// fs node. Each active DID with routeType='extension' becomes one extension
+// rule that bridges to user/<sipUsername>. Other route types fall through to
+// the unrouted-default rule (404) until they're explicitly supported.
+//
+// Drop-in: writes /etc/freeswitch/dialplan/public/01_dids.xml. Public dialplan
+// already has 00_test-inbound.xml (9999 smoke + catch-all 503). Ours sorts
+// before the catch-all by filename, so a matched DID wins.
+export async function syncInboundDidDialplan(): Promise<boolean> {
+  // Pull active DIDs that have a usable extension target. Join into users to
+  // resolve sipUsername. We only emit rules for DIDs that have a working
+  // mapping today; the others drop through to 503.
+  const rows = await db.execute(sql`
+    SELECT d.number, u.sip_username
+    FROM dids d
+    JOIN users u ON u.id = d.route_target_id
+    WHERE d.active = true
+      AND d.route_type = 'extension'
+      AND u.sip_username IS NOT NULL
+      AND u.deleted_at IS NULL
+  `);
+  // execute returns { rows: [...] } in postgres-js but the runtime adapter
+  // may return the array directly — handle both.
+  const list: Array<{ number: string; sip_username: string }> = (rows as any).rows ?? (rows as any);
+
+  const xmlEscape = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c] ?? c));
+  let body = '<include>\n';
+  for (const r of list) {
+    const num = (r.number ?? '').replace(/[^\d+]/g, '');
+    const ext = (r.sip_username ?? '').replace(/[^\d]/g, '');
+    if (!num || !ext) continue;
+    body += `  <extension name="did_${xmlEscape(num)}">\n`;
+    body += `    <condition field="destination_number" expression="^\\+?${num.replace(/^\+/, '')}$">\n`;
+    body += `      <action application="set" data="hangup_after_bridge=true"/>\n`;
+    body += `      <action application="bridge" data="user/${ext}"/>\n`;
+    body += `    </condition>\n`;
+    body += `  </extension>\n`;
+  }
+  body += '</include>\n';
+
+  const fsNodes = await getActiveFreeswitchNodes();
+  if (fsNodes.length === 0) {
+    logger.warn({}, '[esl] no active fs nodes — DID dialplan not pushed');
+    return false;
+  }
+  const localPath = '/tmp/fs_dids.xml';
+  try { writeFileSync(localPath, body); }
+  catch (err: any) {
+    logger.error({ err: err?.message ?? String(err) }, '[esl] could not write DID dialplan');
+    return false;
+  }
+  let anyOk = false;
+  for (const ip of fsNodes) {
+    try {
+      execFileSync('scp', [
+        '-i', SSH_KEY_PATH,
+        '-o', 'StrictHostKeyChecking=accept-new',
+        '-o', 'UserKnownHostsFile=/dev/null',
+        '-o', 'ConnectTimeout=5',
+        '-o', 'BatchMode=yes',
+        localPath,
+        `${SSH_USER}@${ip}:/tmp/01_dids.xml`,
+      ], { timeout: 12000 });
+      execFileSync('ssh', [
+        ...sshArgs(ip),
+        `docker cp /tmp/01_dids.xml ${DOCKER_CONTAINER}:/etc/freeswitch/dialplan/public/01_dids.xml && ` +
+        `docker exec ${DOCKER_CONTAINER} fs_cli -p ${ESL_PW_FOR_SHIP} -x 'reloadxml' && ` +
+        `rm -f /tmp/01_dids.xml`,
+      ], { timeout: 12000 });
+      anyOk = true;
+      logger.info({ ip, didCount: list.length }, '[esl] DID dialplan synced');
+    } catch (err: any) {
+      logger.warn({ err: err?.message ?? String(err), ip }, '[esl] DID dialplan push failed');
+    }
+  }
+  try { unlinkSync(localPath); } catch {}
+  return anyOk;
+}
+
+// Promote a gateway to default outbound carrier across the fleet. Updates
+// vars.xml's default_outbound_gateway on every active fs node and reloadxml's
+// so the dialplan rule (sofia/gateway/${default_outbound_gateway}/...) picks
+// the new value without rewriting the dialplan itself.
+export async function setDefaultOutboundGateway(rawName: string): Promise<boolean> {
+  const name = rawName.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const fsNodes = await getActiveFreeswitchNodes();
+  if (fsNodes.length === 0) {
+    logger.warn({ name }, '[esl] no active fs nodes — default gateway change not applied');
+    return false;
+  }
+  let anyOk = false;
+  for (const ip of fsNodes) {
+    try {
+      execFileSync('ssh', [
+        ...sshArgs(ip),
+        // Replace existing line OR append if missing. The line lives in vars.xml
+        // alongside default_password (set by freeswitch-bootstrap.sh).
+        `docker exec ${DOCKER_CONTAINER} sh -c '` +
+          `grep -q default_outbound_gateway /etc/freeswitch/vars.xml ` +
+          `&& sed -i "s|.*default_outbound_gateway=.*|  <X-PRE-PROCESS cmd=\\"set\\" data=\\"default_outbound_gateway=${name}\\"/>|" /etc/freeswitch/vars.xml ` +
+          `|| sed -i "/default_password=/a \\  <X-PRE-PROCESS cmd=\\"set\\" data=\\"default_outbound_gateway=${name}\\"/>" /etc/freeswitch/vars.xml` +
+          `' && docker exec ${DOCKER_CONTAINER} fs_cli -p ${ESL_PW_FOR_SHIP} -x 'reloadxml'`,
+      ], { timeout: 12000 });
+      anyOk = true;
+      logger.info({ ip, gateway: name }, '[esl] default outbound gateway set');
+    } catch (err: any) {
+      logger.warn({ err: err?.message ?? String(err), ip, gateway: name }, '[esl] default outbound update failed');
+    }
+  }
+  return anyOk;
 }
 
 export function getGatewayStatus(name: string): Promise<string> {

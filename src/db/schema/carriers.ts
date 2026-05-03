@@ -16,5 +16,8 @@ export const carriers = pgTable('carriers', {
   lastRegistered: timestamp('last_registered', { withTimezone: true }),
   reachable: boolean('reachable'),
   lastChecked: timestamp('last_checked', { withTimezone: true }),
+  // Exactly one carrier may be default outbound (partial unique index in DB).
+  // Bootstrap reads this and writes default_outbound_gateway into FS vars.xml.
+  isDefaultOutbound: boolean('is_default_outbound').default(false),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
 });

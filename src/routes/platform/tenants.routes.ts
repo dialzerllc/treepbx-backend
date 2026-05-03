@@ -102,7 +102,21 @@ router.get('/:id', async (c) => {
   if (!row) throw new NotFound('Tenant not found');
   const [wallet] = await db.select().from(wallets).where(eq(wallets.tenantId, row.id));
   const [plan] = row.planId ? await db.select({ name: plans.name }).from(plans).where(eq(plans.id, row.planId)) : [];
-  return c.json({ ...row, wallet: wallet ?? null, planName: plan?.name ?? null });
+  // Surface the tenant's primary admin user so the edit modal can show "The admin email is …"
+  const [admin] = await db.select({ id: users.id, email: users.email, firstName: users.firstName, lastName: users.lastName })
+    .from(users)
+    .where(and(eq(users.tenantId, row.id), eq(users.role, 'tenant_admin'), isNull(users.deletedAt)))
+    .orderBy(users.createdAt)
+    .limit(1);
+  return c.json({
+    ...row,
+    wallet: wallet ?? null,
+    planName: plan?.name ?? null,
+    adminId: admin?.id ?? null,
+    adminEmail: admin?.email ?? null,
+    adminFirstName: admin?.firstName ?? null,
+    adminLastName: admin?.lastName ?? null,
+  });
 });
 
 router.post('/', async (c) => {

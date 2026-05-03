@@ -20,7 +20,7 @@ const rateGroupSchema = z.object({
   voicebotRate: z.union([z.string(), z.number()]).transform(String).default('0.015'),
   byocRate: z.union([z.string(), z.number()]).transform(String).default('0.008'),
   storageRate: z.union([z.string(), z.number()]).transform(String).default('0.10'),
-  effectiveDate: z.string().optional(),
+  effectiveDate: z.string().optional().transform((v) => (v && v.length > 0 ? v : undefined)),
   status: z.enum(['draft', 'active', 'archived']).default('draft'),
 }).passthrough();
 
@@ -180,6 +180,25 @@ router.post('/:id/rate-cards', async (c) => {
   const body = rateCardSchema.parse(await c.req.json());
   const [row] = await db.insert(rateCards).values({ ...body, rateGroupId: c.req.param('id') }).returning();
   return c.json(row, 201);
+});
+
+// Bulk import rate cards into an existing group. FE parses CSV → posts JSON.
+// Same conflict-handling philosophy as the leads import: silently skip dupes
+// (same country/code/direction in the group already exists).
+router.post('/:id/rate-cards/bulk', async (c) => {
+  const groupId = c.req.param('id');
+  const body = z.object({ rows: z.array(rateCardSchema) }).parse(await c.req.json());
+  const [group] = await db.select({ id: rateGroups.id }).from(rateGroups).where(eq(rateGroups.id, groupId));
+  if (!group) throw new NotFound('Rate group not found');
+  const values = body.rows.map((r) => ({ ...r, rateGroupId: groupId }));
+  let created = 0;
+  const batchSize = 500;
+  for (let i = 0; i < values.length; i += batchSize) {
+    const slice = values.slice(i, i + batchSize);
+    const inserted = await db.insert(rateCards).values(slice).returning({ id: rateCards.id });
+    created += inserted.length;
+  }
+  return c.json({ ok: true, created });
 });
 
 router.put('/:id/rate-cards/:cardId', async (c) => {

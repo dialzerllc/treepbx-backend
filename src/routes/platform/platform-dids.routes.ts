@@ -10,7 +10,7 @@ const router = new Hono();
 
 const didSchema = z.object({
   number: z.string().min(1),
-  provider: z.string().min(1),
+  provider: z.preprocess((v) => (typeof v === 'string' && v.trim() === '') ? 'unspecified' : v, z.string().min(1).default('unspecified')),
   city: z.string().nullable().optional(),
   state: z.string().nullable().optional(),
   country: z.string().default('US'),

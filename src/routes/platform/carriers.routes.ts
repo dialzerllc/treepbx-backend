@@ -121,4 +121,25 @@ router.delete('/:id', async (c) => {
   return c.json({ ok: true });
 });
 
+// Promote this carrier to default outbound. Atomic: clear the old default,
+// set the new one, then push default_outbound_gateway into FS vars.xml on
+// every fs node.
+router.post('/:id/set-default-outbound', async (c) => {
+  const id = c.req.param('id');
+  const [row] = await db.select().from(carriers).where(eq(carriers.id, id));
+  if (!row) throw new NotFound('Carrier not found');
+  if (row.status !== 'active') throw new BadRequest('Carrier must be active to be default');
+  if (row.direction === 'inbound') throw new BadRequest('Carrier direction must allow outbound');
+
+  await db.transaction(async (tx) => {
+    await tx.update(carriers).set({ isDefaultOutbound: false });
+    await tx.update(carriers).set({ isDefaultOutbound: true }).where(eq(carriers.id, id));
+  });
+  try {
+    const { setDefaultOutboundGateway } = await import('../../esl/commands');
+    await setDefaultOutboundGateway(row.name);
+  } catch {}
+  return c.json({ ok: true, name: row.name });
+});
+
 export default router;

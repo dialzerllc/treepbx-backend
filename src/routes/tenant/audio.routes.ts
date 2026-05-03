@@ -6,7 +6,7 @@ import { audioFiles, businessHours } from '../../db/schema';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
 import { NotFound, BadRequest } from '../../lib/errors';
 import { requireRole } from '../../middleware/roles';
-import { uploadFile, getFileUrl } from '../../integrations/minio';
+import { uploadFile, getFileUrl, getFileBuffer } from '../../integrations/minio';
 
 const router = new Hono();
 
@@ -131,18 +131,33 @@ router.get('/:id', async (c) => {
   return c.json(row);
 });
 
-// Play audio — returns base64 data as audio stream
+// Play audio — streams the file. Inline fileData (legacy/TTS) wins; otherwise
+// fall back to fetching the bytes from MinIO using minioKey.
 router.get('/:id/play', async (c) => {
   const tenantId = c.get('tenantId')!;
-  const [row] = await db.select({ fileData: audioFiles.fileData, format: audioFiles.format })
-    .from(audioFiles)
+  const [row] = await db.select({
+    fileData: audioFiles.fileData,
+    minioKey: audioFiles.minioKey,
+    format: audioFiles.format,
+  }).from(audioFiles)
     .where(and(eq(audioFiles.id, c.req.param('id')), eq(audioFiles.tenantId, tenantId)));
   if (!row) throw new NotFound('Audio file not found');
-  if (!row.fileData) return c.json({ error: 'No audio data available' }, 404);
 
   const mimeMap: Record<string, string> = { wav: 'audio/wav', mp3: 'audio/mpeg', ogg: 'audio/ogg' };
   const mime = mimeMap[row.format ?? 'wav'] ?? 'audio/wav';
-  const buffer = Buffer.from(row.fileData, 'base64');
+
+  let buffer: Buffer;
+  if (row.fileData) {
+    buffer = Buffer.from(row.fileData, 'base64');
+  } else if (row.minioKey) {
+    try {
+      buffer = await getFileBuffer(row.minioKey);
+    } catch (err: any) {
+      return c.json({ error: 'Audio bytes not found in object store', minioKey: row.minioKey }, 404);
+    }
+  } else {
+    return c.json({ error: 'No audio data available' }, 404);
+  }
 
   c.header('Content-Type', mime);
   c.header('Content-Length', String(buffer.length));

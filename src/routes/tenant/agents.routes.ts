@@ -83,6 +83,9 @@ router.post('/import', requireRole('tenant_admin'), async (c) => {
           tenantId,
           passwordHash,
         });
+        if (agent.sipUsername) {
+          try { const { pushSipUser } = await import('../../esl/commands'); await pushSipUser(agent.sipUsername); } catch {}
+        }
         created++;
         if (!agent.password) {
           results.push({ email: agent.email, tempPassword: tempPass });
@@ -217,6 +220,10 @@ router.post('/', requireRole('tenant_admin'), async (c) => {
   const passwordHash = await hashPassword(tempPass);
   const { password: _, ...insertData } = body;
   const [row] = await db.insert(users).values({ ...insertData, tenantId, passwordHash }).returning();
+  if (row.sipUsername) {
+    try { const { pushSipUser } = await import('../../esl/commands'); await pushSipUser(row.sipUsername); }
+    catch { /* fs push best-effort; row already in DB */ }
+  }
   const { cacheDelPattern } = await import('../../lib/redis');
   await cacheDelPattern(`agents:${tenantId}*`);
   return c.json({ ...row, tempPassword: customPass ? undefined : tempPass }, 201);
@@ -233,6 +240,11 @@ router.put('/:id', requireRole('tenant_admin', 'supervisor'), async (c) => {
     await checkDuplicateExtension(body.sipUsername, tenantId, c.req.param('id'));
   }
 
+  // Capture pre-update sipUsername so we can clean up the old FS directory
+  // entry if the extension changed.
+  const [pre] = await db.select({ sipUsername: users.sipUsername }).from(users)
+    .where(and(eq(users.id, c.req.param('id')), eq(users.tenantId, tenantId), isNull(users.deletedAt)));
+
   // Handle password change
   const updates: Record<string, unknown> = { ...body, updatedAt: new Date() };
   if (raw.password && typeof raw.password === 'string' && raw.password.length >= 6) {
@@ -245,6 +257,14 @@ router.put('/:id', requireRole('tenant_admin', 'supervisor'), async (c) => {
     .where(and(eq(users.id, c.req.param('id')), eq(users.tenantId, tenantId), isNull(users.deletedAt)))
     .returning();
   if (!row) throw new NotFound('Agent not found');
+  // Sync FS directory: remove old (if extension changed), push current.
+  try {
+    const { pushSipUser, removeSipUser } = await import('../../esl/commands');
+    if (pre?.sipUsername && pre.sipUsername !== row.sipUsername) {
+      await removeSipUser(pre.sipUsername);
+    }
+    if (row.sipUsername) await pushSipUser(row.sipUsername);
+  } catch { /* best-effort */ }
   const { cacheDelPattern } = await import('../../lib/redis');
   await cacheDelPattern(`agents:${tenantId}*`);
   return c.json(row);
@@ -255,10 +275,18 @@ router.post('/bulk/delete', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const body = z.object({ ids: z.array(z.string().uuid()) }).parse(await c.req.json());
 
+  // Capture sipUsernames before soft-delete so we can clean FS directory.
+  const toDelete = await db.select({ sipUsername: users.sipUsername }).from(users)
+    .where(and(inArray(users.id, body.ids), eq(users.tenantId, tenantId), isNull(users.deletedAt)));
   const deleted = await db.update(users)
     .set({ deletedAt: new Date() })
     .where(and(inArray(users.id, body.ids), eq(users.tenantId, tenantId), isNull(users.deletedAt)))
     .returning({ id: users.id });
+
+  try {
+    const { removeSipUser } = await import('../../esl/commands');
+    for (const r of toDelete) { if (r.sipUsername) await removeSipUser(r.sipUsername); }
+  } catch { /* best-effort */ }
 
   const { cacheDelPattern } = await import('../../lib/redis');
   await cacheDelPattern(`agents:${tenantId}*`);
@@ -273,6 +301,10 @@ router.delete('/:id', requireRole('tenant_admin'), async (c) => {
     .where(and(eq(users.id, c.req.param('id')), eq(users.tenantId, tenantId), isNull(users.deletedAt)))
     .returning();
   if (!row) throw new NotFound('Agent not found');
+  if (row.sipUsername) {
+    try { const { removeSipUser } = await import('../../esl/commands'); await removeSipUser(row.sipUsername); }
+    catch { /* best-effort */ }
+  }
   const { cacheDelPattern } = await import('../../lib/redis');
   await cacheDelPattern(`agents:${tenantId}*`);
   return c.json({ ok: true });
@@ -372,6 +404,12 @@ router.put('/:id/dids', requireRole('tenant_admin', 'supervisor'), async (c) => 
   await db.delete(agentDids).where(eq(agentDids.agentId, agentId));
   if (body.didIds.length > 0) {
     await db.insert(agentDids).values(body.didIds.map((didId) => ({ agentId, didId })));
+  }
+
+  // Re-push the FS directory entry so the agent's new caller-ID takes effect immediately.
+  const [a] = await db.select({ sipUsername: users.sipUsername }).from(users).where(eq(users.id, agentId));
+  if (a?.sipUsername) {
+    try { const { pushSipUser } = await import('../../esl/commands'); void pushSipUser(a.sipUsername); } catch {}
   }
 
   // Invalidate cache

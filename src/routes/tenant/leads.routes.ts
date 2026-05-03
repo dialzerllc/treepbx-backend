@@ -81,7 +81,13 @@ router.post('/import', requireRole('tenant_admin', 'supervisor'), async (c) => {
       status: 'pending',
     }));
     try {
-      const inserted = await db.insert(leads).values(values).onConflictDoNothing().returning({ id: leads.id });
+      // Conflict target = the (tenant_id, lead_list_id, phone) unique index.
+      // Without specifying target, pre-existing PG would silently insert dupes
+      // when no constraint matched; with the index, this gives accurate
+      // created/skipped counts on re-uploads.
+      const inserted = await db.insert(leads).values(values)
+        .onConflictDoNothing({ target: [leads.tenantId, leads.leadListId, leads.phone] })
+        .returning({ id: leads.id });
       created += inserted.length;
       skipped += values.length - inserted.length;
     } catch {

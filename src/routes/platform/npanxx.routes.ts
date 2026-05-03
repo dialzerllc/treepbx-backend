@@ -35,8 +35,32 @@ router.get('/', async (c) => {
 });
 
 router.post('/import', async (c) => {
-  // CSV import placeholder — full implementation requires multipart parsing + bulk insert
-  return c.json({ ok: true, message: 'CSV import job queued' }, 202);
+  // Bulk insert NPANXX rows. FE parses CSV and posts JSON to keep this
+  // endpoint type-safe; we don't accept multipart here. Conflicts on the
+  // (npa, nxx) primary key are skipped silently.
+  const body = z.object({
+    rows: z.array(z.object({
+      npa: z.string().min(3).max(3),
+      nxx: z.string().min(3).max(3),
+      state: z.string().nullable().optional(),
+      city: z.string().nullable().optional(),
+      county: z.string().nullable().optional(),
+      timezone: z.string().nullable().optional(),
+      rateCenter: z.string().nullable().optional(),
+      carrier: z.string().nullable().optional(),
+      lineType: z.string().nullable().optional(),
+    })),
+  }).parse(await c.req.json());
+
+  let created = 0; let skipped = 0;
+  const batchSize = 500;
+  for (let i = 0; i < body.rows.length; i += batchSize) {
+    const slice = body.rows.slice(i, i + batchSize);
+    const inserted = await db.insert(npaNxx).values(slice).onConflictDoNothing().returning({ npa: npaNxx.npa });
+    created += inserted.length;
+    skipped += slice.length - inserted.length;
+  }
+  return c.json({ ok: true, created, skipped });
 });
 
 export default router;

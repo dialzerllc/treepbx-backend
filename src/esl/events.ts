@@ -1,12 +1,14 @@
 import { eslClient } from './client';
 import { db } from '../db/client';
-import { calls, carriers, users, leads, tenants, plans, rateGroups, rateCards } from '../db/schema';
+import { calls, carriers, users, leads, tenants, plans, rateGroups, rateCards, dids } from '../db/schema';
 import { eq, and, isNull } from 'drizzle-orm';
 import { publishCallRinging, publishCallEnded, publishAgentStatus, publishCampaignDashboard } from '../ws/publisher';
 import { billingQueue } from '../lib/queue';
 import { logger } from '../lib/logger';
 
-// Helper: find call by freeswitchUuid, or fall back to matching by channel variable or caller+callee
+// Helper: find call by freeswitchUuid, or fall back to matching by channel variable or caller+callee.
+// If no row exists and this is an A-leg from sofia, insert a new row so softphone calls
+// (which have no backend pre-row) still appear in the call trace.
 async function findAndLinkCall(uuid: string, headers: Record<string, string>) {
   // First try direct UUID match
   const [existing] = await db.select({ id: calls.id }).from(calls)
@@ -18,29 +20,88 @@ async function findAndLinkCall(uuid: string, headers: Record<string, string>) {
   if (callId) {
     const result = await db.update(calls).set({ freeswitchUuid: uuid })
       .where(and(eq(calls.id, callId), isNull(calls.freeswitchUuid)));
-    const linked = (result as any).rowCount > 0;
-    if (linked) {
+    if ((result as any).rowCount > 0) {
       logger.info({ uuid, callId }, 'Linked FreeSWITCH UUID to call via treepbx_call_id');
       return true;
     }
   }
 
-  // Fall back: match a ringing call without a freeswitchUuid by caller + callee
   const caller = headers['Caller-Caller-ID-Number'] || headers['variable_sip_from_user'];
   const callee = headers['Caller-Destination-Number'] || headers['variable_sip_to_user'];
-  if (!caller && !callee) return false;
 
-  const conditions: any[] = [isNull(calls.freeswitchUuid), eq(calls.status, 'ringing')];
-  if (caller) conditions.push(eq(calls.callerId, caller));
-  if (callee) conditions.push(eq(calls.calleeNumber, callee));
+  // Fall back: match a ringing call without a freeswitchUuid by caller + callee
+  if (caller || callee) {
+    const conditions: any[] = [isNull(calls.freeswitchUuid), eq(calls.status, 'ringing')];
+    if (caller) conditions.push(eq(calls.callerId, caller));
+    if (callee) conditions.push(eq(calls.calleeNumber, callee));
 
-  const result = await db.update(calls).set({ freeswitchUuid: uuid })
-    .where(and(...conditions));
-  const linked = (result as any).rowCount > 0;
-  if (linked) {
-    logger.info({ uuid, caller, callee }, 'Linked FreeSWITCH UUID to call via caller/callee match');
+    const result = await db.update(calls).set({ freeswitchUuid: uuid })
+      .where(and(...conditions));
+    if ((result as any).rowCount > 0) {
+      logger.info({ uuid, caller, callee }, 'Linked FreeSWITCH UUID to call via caller/callee match');
+      return true;
+    }
   }
-  return linked;
+
+  // Nothing matched. Insert a new row for the A-leg of softphone / DID calls
+  // that don't go through the dialer or WS click-to-call paths. Skip B-legs
+  // (peer channel created by an originate) so each logical call gets one row.
+  const isPeerLeg = !!headers['variable_originator'];
+  if (isPeerLeg) return false;
+
+  const channelName = headers['Channel-Name'] || '';
+  if (!channelName.startsWith('sofia/')) return false;
+  if (!caller || !callee) return false;
+
+  const isInternal = channelName.startsWith('sofia/internal/');
+  const direction = isInternal ? 'outbound' : 'inbound';
+
+  let tenantId: string | null = null;
+  let agentId: string | null = null;
+  let didId: string | null = null;
+
+  if (isInternal) {
+    const sipFromUser = headers['variable_sip_from_user'] || '';
+    if (sipFromUser) {
+      const [u] = await db.select({ id: users.id, tenantId: users.tenantId })
+        .from(users).where(eq(users.sipUsername, sipFromUser)).limit(1);
+      if (u?.tenantId) {
+        tenantId = u.tenantId;
+        agentId = u.id;
+      }
+    }
+  } else {
+    const [d] = await db.select({ id: dids.id, tenantId: dids.tenantId })
+      .from(dids).where(eq(dids.number, callee)).limit(1);
+    if (d) {
+      tenantId = d.tenantId;
+      didId = d.id;
+    }
+  }
+
+  if (!tenantId) {
+    logger.warn({ uuid, channelName, caller, callee }, 'ESL: cannot insert call, tenant not resolved');
+    return false;
+  }
+
+  try {
+    await db.insert(calls).values({
+      freeswitchUuid: uuid,
+      tenantId,
+      direction,
+      callerId: caller,
+      calleeNumber: callee,
+      status: 'ringing',
+      agentId,
+      didId,
+      startedAt: new Date(),
+    });
+    logger.info({ uuid, tenantId, direction, caller, callee, agentId, didId }, 'ESL: inserted call from CHANNEL_CREATE');
+    return true;
+  } catch (err) {
+    logger.error({ uuid, err }, 'ESL: failed to insert call');
+    return false;
+  }
 }
 
 // Track wrap-up timers so we can cancel on re-dial

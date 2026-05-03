@@ -501,6 +501,13 @@ router.post('/', requireRole('tenant_admin'), async (c) => {
   const [row] = await db.insert(dids).values({ ...body, tenantId }).returning();
   const { cacheDelPattern } = await import('../../lib/redis');
   await cacheDelPattern(`dids:${tenantId}*`);
+  // Refresh inbound dialplan (best-effort, runs async)
+  try {
+    const cmds = await import('../../esl/commands');
+    void cmds.syncInboundDidDialplan();
+    // DID change ⇒ tenant default outbound caller-id may have moved → re-push every agent's directory entry.
+    void cmds.repushSipUsersForTenant(tenantId);
+  } catch {}
   return c.json(row, 201);
 });
 
@@ -543,6 +550,12 @@ router.put('/:id', requireRole('tenant_admin'), async (c) => {
 
   const { cacheDelPattern } = await import('../../lib/redis');
   await cacheDelPattern(`dids:${tenantId}*`);
+  try {
+    const cmds = await import('../../esl/commands');
+    void cmds.syncInboundDidDialplan();
+    // DID change ⇒ tenant default outbound caller-id may have moved → re-push every agent's directory entry.
+    void cmds.repushSipUsersForTenant(tenantId);
+  } catch {}
   return c.json(row);
 });
 
@@ -570,6 +583,12 @@ router.delete('/:id', requireRole('tenant_admin'), async (c) => {
 
   const { cacheDelPattern } = await import('../../lib/redis');
   await cacheDelPattern(`dids:${tenantId}*`);
+  try {
+    const cmds = await import('../../esl/commands');
+    void cmds.syncInboundDidDialplan();
+    // DID change ⇒ tenant default outbound caller-id may have moved → re-push every agent's directory entry.
+    void cmds.repushSipUsersForTenant(tenantId);
+  } catch {}
   return c.json({ ok: true });
 });
 

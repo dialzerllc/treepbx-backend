@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, integer, boolean, jsonb, timestamp, index } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, text, integer, boolean, jsonb, timestamp, index, uniqueIndex } from 'drizzle-orm/pg-core';
 import { tenants } from './tenants';
 import { leadLists } from './lead-lists';
 
@@ -32,4 +32,7 @@ export const leads = pgTable('leads', {
   index('idx_leads_tenant_list').on(table.tenantId, table.leadListId),
   index('idx_leads_phone').on(table.tenantId, table.phone),
   index('idx_leads_status').on(table.tenantId, table.status, table.nextAttemptAt),
+  // Dedupe re-uploads of the same phone into the same list. Different lists
+  // (e.g. "Old leads" + "New campaign") may legitimately hold the same phone.
+  uniqueIndex('uq_leads_tenant_list_phone').on(table.tenantId, table.leadListId, table.phone),
 ]);

@@ -28,11 +28,50 @@ SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=
 DB_HOST="${DATABASE_URL##*@}"
 DB_HOST="${DB_HOST%/*}"
 DB_HOST="${DB_HOST%:*}"
-FS_IPS=$(PGPASSWORD="${DATABASE_URL#*:}" PGPASSWORD="$(echo "$DATABASE_URL" | sed -E 's|postgres://[^:]+:([^@]+)@.*|\1|')" \
-  psql "$DATABASE_URL" -At -c \
+FS_IPS=$(psql "$DATABASE_URL" -At -c \
   "SELECT public_ip FROM media_nodes WHERE service_type='freeswitch' AND state IN ('active','provisioning') ORDER BY hetzner_id;")
 
 [ -z "$FS_IPS" ] && { echo "[kamailio-bootstrap] no freeswitch nodes in DB; aborting"; exit 1; }
+
+# Carrier ACL: only INVITEs from these source IPs may dispatch into the FS fleet.
+# Pulled from carriers table (any carrier with direction in/both and status=active).
+# Hosts are resolved to A records — if a carrier sends INVITEs from a different
+# IP than its inbound host, set carriers.host to that signaling IP explicitly.
+CARRIER_HOSTS=$(psql "$DATABASE_URL" -At -c \
+  "SELECT host FROM carriers WHERE status='active' AND direction IN ('inbound','both');")
+CARRIER_IPS=""
+while IFS= read -r h; do
+  [ -z "$h" ] && continue
+  # Already an IPv4 literal? use as-is. Otherwise resolve.
+  if [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then ips="$h"
+  else ips=$(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}' | sort -u); fi
+  for ip in $ips; do CARRIER_IPS+="$ip"$'\n'; done
+done <<< "$CARRIER_HOSTS"
+CARRIER_IPS=$(printf '%s' "$CARRIER_IPS" | sort -u | sed '/^$/d')
+
+# Build two `if`-chain allowlists. Empty list ⇒ "0" so the branch never
+# matches (kamailio falls through to the 403 default-deny).
+#
+# CARRIER_ACL — sources kamailio dispatches INWARD into the FS pool.
+# FS_ACL      — internal FS sources whose INVITEs we forward OUTBOUND by
+#               Request-URI. POSTROUTING SNAT (below) rewrites the source
+#               IP to the FIP so the carrier sees a stable address even when
+#               fs nodes are added/replaced.
+build_acl() {
+  local ips="$1" expr=""
+  if [ -n "$ips" ]; then
+    while IFS= read -r ip; do
+      [ -z "$ip" ] && continue
+      [ -n "$expr" ] && expr+=" || "
+      expr+="\$si == \"$ip\""
+    done <<< "$ips"
+  else
+    expr="0"
+  fi
+  printf '%s' "$expr"
+}
+CARRIER_ACL=$(build_acl "$CARRIER_IPS")
+FS_ACL=$(build_acl "$FS_IPS")
 
 # Build dispatcher.list
 DISP_TMP="$(mktemp /tmp/disp.XXXXXX.list)"
@@ -99,12 +138,31 @@ request_route {
   }
 
   if (is_method("INVITE")) {
-    record_route();
-    if (!ds_select_dst("1", "4")) {
-      sl_send_reply("503","No available destinations");
+    # Inbound from carrier → dispatch to FS pool. Carrier IPs come from the
+    # carriers table at bootstrap time. Re-run kamailio-bootstrap (or POST
+    # /platform/autoscaler/rebootstrap?serviceType=sip_proxy) after changing
+    # carriers.
+    if ($CARRIER_ACL) {
+      record_route();
+      if (!ds_select_dst("1", "4")) {
+        sl_send_reply("503","No available destinations");
+        exit;
+      }
+      t_on_failure("RTF_DISPATCHER");
+    }
+    # Outbound from internal FS → forward by Request-URI (carrier address).
+    # POSTROUTING SNAT rewrites src → FIP so the carrier sees a stable
+    # address regardless of which fs node sourced the call. FS IP list comes
+    # from media_nodes (service_type='freeswitch'); also re-bootstrap when
+    # the fs fleet changes.
+    else if ($FS_ACL) {
+      record_route();
+    }
+    else {
+      xlog("L_NOTICE","[acl] reject INVITE from unauthorized source \$si\\n");
+      sl_send_reply("403","Unauthorized source");
       exit;
     }
-    t_on_failure("RTF_DISPATCHER");
   }
 
   if (loose_route()) { route(RELAY); exit; }
@@ -129,4 +187,20 @@ rm -f "$CFG_TMP" "$DISP_TMP"
 
 ssh $SSH_OPTS root@"$SIP_IP" "kamailio -c -f /etc/kamailio/kamailio.cfg >/dev/null && systemctl restart kamailio && sleep 1 && systemctl is-active kamailio"
 
-echo "[kamailio-bootstrap] $SIP_IP — config + dispatcher applied (FS targets: $(echo "$FS_IPS" | wc -l))"
+# SNAT outbound UDP/5060 to use the FIP as src. Without this, kamailio replies
+# leak the underlying server's primary IP, which strict carriers reject as a
+# Via/L4 mismatch. The FIP is the only IP the carrier knows about. Persisted
+# via netfilter-persistent so it survives reboot.
+ssh $SSH_OPTS root@"$SIP_IP" "
+  set -e
+  # Preseed debconf so iptables-persistent installs without prompting.
+  echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
+  echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q netfilter-persistent iptables-persistent >/dev/null 2>&1 || true
+  iptables -t nat -C POSTROUTING -o eth0 -p udp --sport 5060 -j SNAT --to-source $FIP 2>/dev/null \
+    || iptables -t nat -A POSTROUTING -o eth0 -p udp --sport 5060 -j SNAT --to-source $FIP
+  mkdir -p /etc/iptables
+  netfilter-persistent save >/dev/null 2>&1 || iptables-save > /etc/iptables/rules.v4
+"
+
+echo "[kamailio-bootstrap] $SIP_IP — config + dispatcher applied (FS targets/internal-ACL: $(echo "$FS_IPS" | sed '/^$/d' | wc -l), carrier ACL ips: $(echo "$CARRIER_IPS" | sed '/^$/d' | wc -l))"
