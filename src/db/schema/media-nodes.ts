@@ -21,6 +21,8 @@ export const mediaNodes = pgTable('media_nodes', {
   cpuPct: real('cpu_pct'),
   lastHeartbeatAt: timestamp('last_heartbeat_at', { withTimezone: true }),
   drainStartedAt: timestamp('drain_started_at', { withTimezone: true }),
+  serviceType: text('service_type').notNull().default('freeswitch'),
+  location: text('location'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
 }, (t) => [
   index('idx_media_nodes_state').on(t.state),
