@@ -252,18 +252,13 @@ function removeUserXmlOnNode(ip: string, sipUsername: string): void {
 /** Provision (or refresh) an FS directory entry for an agent. Safe to call on
  *  every agent create/update — overwrites the file. Returns true if at least
  *  one fs node accepted the change. */
-export async function pushSipUser(sipUsername: string): Promise<boolean> {
-  if (!/^\d{1,4}$/.test(sipUsername)) {
-    logger.warn({ sipUsername }, '[esl] invalid sip username — skipping directory push');
-    return false;
-  }
-
-  // Resolve a real outbound caller ID for this agent so softphone WSS dials
-  // present a number the carrier (and the called party) will recognise — not
-  // the internal extension. Order: agent's first assigned DID → tenant's
-  // first active DID → null (fall back to FS global ${outbound_caller_id}).
-  let outboundCallerNumber: string | null = null;
-  let displayName: string | null = null;
+// Resolve the outbound caller-ID number + display name for an agent. Used by
+// pushSipUser (FS directory) AND by the click-to-call origin flow in
+// ws/handlers.ts so both paths present the same caller-ID. Order:
+//   1. agent's first assigned DID (agent_dids → dids)
+//   2. tenant's first active DID
+//   3. null (fall back to FS global ${outbound_caller_id} or extension)
+export async function resolveOutboundCallerId(agentId: string): Promise<{ number: string | null; name: string | null }> {
   try {
     const [agent] = await db.select({
       id: users.id,
@@ -271,27 +266,45 @@ export async function pushSipUser(sipUsername: string): Promise<boolean> {
       firstName: users.firstName,
       lastName: users.lastName,
     }).from(users)
-      .where(and(eq(users.sipUsername, sipUsername), isNull(users.deletedAt)))
+      .where(and(eq(users.id, agentId), isNull(users.deletedAt)))
       .limit(1);
-    if (agent) {
-      displayName = `${agent.firstName ?? ''} ${agent.lastName ?? ''}`.trim() || null;
-      const [assigned] = await db.select({ number: dids.number })
-        .from(agentDids)
-        .innerJoin(dids, eq(dids.id, agentDids.didId))
-        .where(and(eq(agentDids.agentId, agent.id), eq(dids.active, true)))
+    if (!agent) return { number: null, name: null };
+    const name = `${agent.firstName ?? ''} ${agent.lastName ?? ''}`.trim() || null;
+    const [assigned] = await db.select({ number: dids.number })
+      .from(agentDids)
+      .innerJoin(dids, eq(dids.id, agentDids.didId))
+      .where(and(eq(agentDids.agentId, agent.id), eq(dids.active, true)))
+      .limit(1);
+    if (assigned) return { number: assigned.number, name };
+    if (agent.tenantId) {
+      const [tenantDid] = await db.select({ number: dids.number })
+        .from(dids)
+        .where(and(eq(dids.tenantId, agent.tenantId), eq(dids.active, true)))
         .limit(1);
-      if (assigned) outboundCallerNumber = assigned.number;
-      if (!outboundCallerNumber && agent.tenantId) {
-        const [tenantDid] = await db.select({ number: dids.number })
-          .from(dids)
-          .where(and(eq(dids.tenantId, agent.tenantId), eq(dids.active, true)))
-          .limit(1);
-        if (tenantDid) outboundCallerNumber = tenantDid.number;
-      }
+      if (tenantDid) return { number: tenantDid.number, name };
     }
+    return { number: null, name };
   } catch (err: any) {
-    logger.warn({ err: err?.message ?? String(err), sipUsername }, '[esl] caller-id lookup failed; using FS defaults');
+    logger.warn({ err: err?.message ?? String(err), agentId }, '[esl] resolveOutboundCallerId failed');
+    return { number: null, name: null };
   }
+}
+
+async function resolveOutboundCallerIdBySip(sipUsername: string): Promise<{ number: string | null; name: string | null }> {
+  const [agent] = await db.select({ id: users.id }).from(users)
+    .where(and(eq(users.sipUsername, sipUsername), isNull(users.deletedAt)))
+    .limit(1);
+  if (!agent) return { number: null, name: null };
+  return resolveOutboundCallerId(agent.id);
+}
+
+export async function pushSipUser(sipUsername: string): Promise<boolean> {
+  if (!/^\d{1,4}$/.test(sipUsername)) {
+    logger.warn({ sipUsername }, '[esl] invalid sip username — skipping directory push');
+    return false;
+  }
+
+  const { number: outboundCallerNumber, name: displayName } = await resolveOutboundCallerIdBySip(sipUsername);
 
   const escapeXml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   const cidNumber = outboundCallerNumber ?? `$\${outbound_caller_id}`;

@@ -179,9 +179,18 @@ export async function handleMessage(ws: ServerWebSocket<WsData>, raw: string) {
       case 'call:offer': {
         const { targetExt, sdp, callerId: customCallerId } = msg.data as { targetExt: string; sdp: string; callerId?: string };
         const callerInfo = await getUserInfo(user.sub);
-        const effectiveCallerId = customCallerId || callerInfo.ext || user.sub;
+        // For external dials, resolve the agent's real outbound caller-ID
+        // (assigned DID → tenant DID) so the carrier sees a presentable
+        // number, not the internal extension. Internal ext-to-ext keeps the
+        // extension as caller-ID so receiving agents can still see it.
+        let resolvedCid: string | null = null;
+        if (!customCallerId && /^\+?\d{7,}$/.test(targetExt)) {
+          const r = await import('../esl/commands').then(m => m.resolveOutboundCallerId(user.sub));
+          resolvedCid = r.number;
+        }
+        const effectiveCallerId = customCallerId || resolvedCid || callerInfo.ext || user.sub;
         const callerDisplay = `${callerInfo.name}${callerInfo.ext ? ` (${callerInfo.ext})` : ''}`;
-        logger.info({ from: user.sub, callerDisplay, targetExt, callerId: effectiveCallerId }, 'Call offer received');
+        logger.info({ from: user.sub, callerDisplay, targetExt, callerId: effectiveCallerId, customCid: !!customCallerId, resolvedCid }, 'Call offer received');
 
         // Look up target agent name for callee display
         const targetInfo = await (async () => {
