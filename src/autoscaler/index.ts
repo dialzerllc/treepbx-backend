@@ -16,6 +16,7 @@ import { asc, eq } from 'drizzle-orm';
 import { observer, type Observation } from './observer';
 import { planner, type Plan, type PlannerRule } from './planner';
 import { reaper } from './reaper';
+import { executeProvision } from './executor';
 import {
   logDecision, isEnabled, isShadow,
   cooldownActive, ruleCooldownActive,
@@ -97,17 +98,60 @@ export async function runAutoscalerTick(): Promise<void> {
     return;
   }
 
-  // Real execution path. Stubbed for now — we don't wire the Hetzner API call
-  // into this session until we've reviewed shadow-mode decisions.
-  // TODO(autoscaler): add executor.ts that calls Hetzner hcloud API + updates DB.
-  logger.warn({ plan }, '[autoscaler] executor not wired yet — decision dropped');
-  await logDecision({
-    kind: 'skip',
-    reason: 'executor_not_wired',
-    scalingRuleId: plan.matchedRule?.id ?? null,
-    targetCc: obs.targetCc,
-    currentCc: obs.activeCc,
-    carrierCeiling: obs.carrierCeiling,
-    shadow: false,
-  });
+  // Real execution. Two arms:
+  //   - provision: fire createServer + insert media_nodes rows
+  //   - drainNodeIds: flip rows to 'draining'; on-box agents handle the rest
+  if (plan.provision === 0 && plan.drainNodeIds.length === 0) {
+    await logDecision({
+      kind: 'skip',
+      reason: `no-op: ${plan.summary}`,
+      scalingRuleId: plan.matchedRule?.id ?? null,
+      shadow: false,
+    });
+    return;
+  }
+
+  if (plan.provision > 0) {
+    try {
+      const created = await executeProvision({
+        count: plan.provision,
+        // Planner is currently scoped to freeswitch — see SERVICE_SCOPE in planner.ts.
+        // When the autoscaler grows multi-service, the rule should drive serviceType.
+        serviceType: 'freeswitch',
+      });
+      for (const c of created) {
+        await logDecision({
+          kind: 'provision',
+          nodeId: c.nodeId,
+          reason: `executor: created ${c.name} (${c.publicIp})`,
+          scalingRuleId: plan.matchedRule?.id ?? null,
+          targetCc: obs.targetCc,
+          currentCc: obs.activeCc,
+          carrierCeiling: obs.carrierCeiling,
+          shadow: false,
+        });
+      }
+      logger.info({ created: created.length, plan }, '[autoscaler] provision executed');
+    } catch (err: any) {
+      logger.error({ err: err?.message ?? String(err) }, '[autoscaler] provision failed');
+      await logDecision({
+        kind: 'skip',
+        reason: `executor_error: ${err?.message ?? String(err)}`.slice(0, 240),
+        scalingRuleId: plan.matchedRule?.id ?? null,
+        shadow: false,
+      });
+    }
+  }
+
+  // Drain (v1: planner doesn't populate drainNodeIds yet; reserved for later).
+  if (plan.drainNodeIds.length > 0) {
+    const { executeDrain } = await import('./executor');
+    const n = await executeDrain(plan.drainNodeIds);
+    await logDecision({
+      kind: 'drain',
+      reason: `executor: drained ${n} nodes`,
+      scalingRuleId: plan.matchedRule?.id ?? null,
+      shadow: false,
+    });
+  }
 }
