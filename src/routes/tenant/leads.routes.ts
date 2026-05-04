@@ -179,12 +179,10 @@ router.get('/', async (c) => {
   if (raw.search) conditions.push(like(leads.phone, `%${raw.search}%`));
   if (raw.leadListId) {
     conditions.push(eq(leads.leadListId, raw.leadListId));
-  } else {
-    // Default: show only leads from the default list
-    const [defaultList] = await db.select({ id: leadLists.id }).from(leadLists)
-      .where(and(eq(leadLists.tenantId, tenantId), eq(leadLists.isDefault, true)));
-    if (defaultList) conditions.push(eq(leads.leadListId, defaultList.id));
   }
+  // No leadListId filter → show leads from every list. The page exposes a
+  // List dropdown for narrowing; defaulting to a single hidden list confuses
+  // tenants who imported into a non-default list.
   if (raw.status) conditions.push(eq(leads.status, raw.status));
   if (raw.dnc !== undefined) conditions.push(eq(leads.dnc, raw.dnc));
   const where = and(...conditions);
