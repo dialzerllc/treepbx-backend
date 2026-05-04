@@ -99,19 +99,29 @@ async function dialLoop(state: DialerState) {
       isNull(users.deletedAt),
     ));
 
+    // Sweeper: any CDR for this campaign that's been stuck in 'ringing' with
+    // no FreeSWITCH UUID for >30s is an orphan — the originate either failed
+    // before FS produced a CHANNEL_CREATE event, or events.ts never linked it.
+    // Mark these failed so they stop counting against `active` (and the
+    // dialer can keep dialing toward the linesToDial target).
+    await db.update(calls).set({
+      status: 'failed',
+      hangupCause: 'ORIGINATE_TIMEOUT',
+      endedAt: new Date(),
+    }).where(and(
+      eq(calls.campaignId, state.campaignId),
+      eq(calls.status, 'ringing'),
+      isNull(calls.freeswitchUuid),
+      lte(calls.startedAt, sql`NOW() - INTERVAL '30 seconds'`),
+    ));
+
     if (available === 0) return;
 
-    // Calculate lines to dial
-    let linesToDial = 0;
-    if (state.dialMode === 'progressive') {
-      linesToDial = available;
-    } else if (state.dialMode === 'predictive') {
-      linesToDial = Math.ceil(available * state.dialRatio);
-    } else if (state.dialMode === 'preview') {
-      linesToDial = 1;
-    } else {
-      linesToDial = available; // Default
-    }
+    // Lines per tick = dial_ratio × available_agents. Preview mode is the
+    // exception (always 1, agent reviews before dialing).
+    const linesToDial = state.dialMode === 'preview'
+      ? 1
+      : Math.ceil(available * state.dialRatio);
 
     // Count active calls for this campaign
     const [{ active }] = await db.select({
