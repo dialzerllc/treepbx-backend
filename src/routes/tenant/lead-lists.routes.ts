@@ -308,4 +308,59 @@ router.post('/:id/remove-duplicates', requireRole('tenant_admin'), async (c) => 
   return c.json({ ok: true, removed });
 });
 
+// Cleanup: mark leads as DNC if every prior call attempt returned a
+// "dead number" hangup cause. Uses your own dial history as the truth source —
+// no external HLR/LRN API needed. The dialer skips dnc=true leads, so this
+// permanently removes dead numbers from the dial pool.
+//
+// Definitive-disconnect causes (always treated as dead):
+//   - USER_NOT_REGISTERED (SIP 480 — number not provisioned)
+//   - INVALID_NUMBER_FORMAT
+//   - NO_ROUTE_DESTINATION
+//   - UNALLOCATED_NUMBER (SIP 404)
+//   - NUMBER_CHANGED
+// "Soft" causes need at least 2 attempts before flagging:
+//   - DESTINATION_OUT_OF_ORDER (SIP 502 — sometimes transient)
+//   - NETWORK_OUT_OF_ORDER
+router.post('/:id/cleanup', requireRole('tenant_admin', 'supervisor'), async (c) => {
+  const tenantId = c.get('tenantId')!;
+  const listId = c.req.param('id');
+
+  const [list] = await db.select({ id: leadLists.id })
+    .from(leadLists)
+    .where(and(eq(leadLists.id, listId), eq(leadLists.tenantId, tenantId)));
+  if (!list) throw new NotFound('Lead list not found');
+
+  // Run as a single SQL statement so we don't pull millions of rows into JS.
+  const result = await db.execute(sql`
+    WITH dead AS (
+      SELECT l.id
+      FROM leads l
+      JOIN calls c ON c.tenant_id = l.tenant_id AND c.callee_number = l.phone
+      WHERE l.lead_list_id = ${listId}
+        AND l.tenant_id = ${tenantId}
+        AND l.dnc = false
+      GROUP BY l.id
+      HAVING (
+        BOOL_OR(c.hangup_cause IN (
+          'USER_NOT_REGISTERED', 'INVALID_NUMBER_FORMAT',
+          'NO_ROUTE_DESTINATION', 'UNALLOCATED_NUMBER', 'NUMBER_CHANGED'
+        ))
+        OR COUNT(*) FILTER (WHERE c.hangup_cause IN (
+          'DESTINATION_OUT_OF_ORDER', 'NETWORK_OUT_OF_ORDER'
+        )) >= 2
+      )
+    )
+    UPDATE leads SET dnc = true, dnc_reason = 'auto-cleanup: dead number'
+    WHERE id IN (SELECT id FROM dead)
+    RETURNING id
+  `);
+  const flagged = (result as any).length ?? 0;
+
+  const { cacheDelPattern } = await import('../../lib/redis');
+  await cacheDelPattern(`leadlists:${tenantId}*`);
+  await cacheDelPattern(`leads:${tenantId}*`);
+  return c.json({ ok: true, flagged });
+});
+
 export default router;
