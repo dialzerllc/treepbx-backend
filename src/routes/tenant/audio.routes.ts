@@ -7,6 +7,7 @@ import { paginationSchema, paginate, paginatedResponse } from '../../lib/paginat
 import { NotFound, BadRequest } from '../../lib/errors';
 import { requireRole } from '../../middleware/roles';
 import { uploadFile, getFileUrl, getFileBuffer } from '../../integrations/minio';
+import { synthesize } from '../../integrations/piper';
 
 const router = new Hono();
 
@@ -59,9 +60,21 @@ router.post('/upload', requireRole('tenant_admin', 'supervisor'), async (c) => {
   return c.json({ key, url, name: file.name, size: buffer.length, contentType: file.type }, 201);
 });
 
-// TTS placeholder
+// Generate audio bytes from text via Piper. Returns raw WAV — useful for
+// preview before save. Use POST / with source='tts' to persist.
 router.post('/tts', requireRole('tenant_admin', 'supervisor'), async (c) => {
-  return c.json({ ok: true, message: 'TTS generation queued' }, 202);
+  const body = z.object({
+    text: z.string().min(1).max(5000),
+    voice: z.string().optional(),
+  }).parse(await c.req.json());
+  try {
+    const buffer = await synthesize(body.text, body.voice);
+    c.header('Content-Type', 'audio/wav');
+    c.header('Content-Length', String(buffer.length));
+    return c.body(buffer);
+  } catch (err: any) {
+    return c.json({ error: 'TTS engine unavailable', detail: err.message }, 503);
+  }
 });
 
 // Business hours (after-hours) sub-routes
@@ -170,9 +183,23 @@ router.post('/', requireRole('tenant_admin', 'supervisor'), async (c) => {
   const [dup] = await db.select({ id: audioFiles.id }).from(audioFiles)
     .where(and(eq(audioFiles.name, body.name), eq(audioFiles.tenantId, tenantId)));
   if (dup) throw new BadRequest('Audio file name already exists');
-  if (!body.minioKey) {
+
+  if (body.source === 'tts') {
+    if (!body.ttsText?.trim()) throw new BadRequest('ttsText is required for TTS source');
+    let buffer: Buffer;
+    try {
+      buffer = await synthesize(body.ttsText, body.ttsVoice ?? undefined);
+    } catch (err: any) {
+      return c.json({ error: 'TTS engine unavailable', detail: err.message }, 503);
+    }
+    body.minioKey = `audio/${tenantId}/${Date.now()}-${body.name.replace(/[^a-zA-Z0-9]/g, '_')}.wav`;
+    await uploadFile(body.minioKey, buffer, 'audio/wav');
+    body.format = 'wav';
+    body.sizeBytes = buffer.length;
+  } else if (!body.minioKey) {
     body.minioKey = `audio/${tenantId}/${Date.now()}-${body.name.replace(/[^a-zA-Z0-9]/g, '_')}.${body.format ?? 'wav'}`;
   }
+
   const [row] = await db.insert(audioFiles).values({ ...body as any, tenantId }).returning();
   return c.json(row, 201);
 });

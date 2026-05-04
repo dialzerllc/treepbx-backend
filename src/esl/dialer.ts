@@ -180,7 +180,7 @@ async function dialLoop(state: DialerState) {
       if (state.leadListIds.length > 0) retryConditions.push(inArray(leads.leadListId, state.leadListIds));
 
       leadsToCall = await db.select().from(leads)
-        .where(and(...retryConditions, inArray(leads.status, ['failed', 'busy', 'no_answer'])))
+        .where(and(...retryConditions, inArray(leads.status, ['retry', 'failed', 'busy', 'no_answer'])))
         .orderBy(asc(leads.lastAttemptAt), asc(leads.createdAt))
         .limit(needed);
 

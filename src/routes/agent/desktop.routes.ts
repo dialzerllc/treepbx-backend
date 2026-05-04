@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { eq, and, desc, gte, sql, inArray } from 'drizzle-orm';
 import { db } from '../../db/client';
-import { calls, leads, users, campaigns, scripts, agentLeadLists, leadLists } from '../../db/schema';
+import { calls, leads, users, campaigns, scripts, agentLeadLists, leadLists, followUpTodos } from '../../db/schema';
 import { count, asc } from 'drizzle-orm';
 
 const router = new Hono();
@@ -184,15 +184,42 @@ const dispositionSchema = z.object({
 router.post('/call/disposition', async (c) => {
   const body = dispositionSchema.parse(await c.req.json());
   const tenantId = c.get('tenantId')!;
+  const userId = c.get('user').sub;
 
-  await db.update(calls).set({
+  const [call] = await db.update(calls).set({
     disposition: body.disposition,
     status: 'completed',
     endedAt: new Date(),
-  }).where(and(eq(calls.id, body.callId), eq(calls.tenantId, tenantId)));
+  }).where(and(eq(calls.id, body.callId), eq(calls.tenantId, tenantId)))
+    .returning({ leadId: calls.leadId, calleeNumber: calls.calleeNumber, calleeName: calls.calleeName });
 
-  // Update agent status back to available
-  const userId = c.get('user').sub;
+  if (call?.leadId) {
+    // Append wrap-up note + summary into lead notes (timestamped) so the
+    // next agent who opens this lead sees the prior context.
+    const ts = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    const blob = [body.note, body.summary].filter((s) => s && s.trim()).join('\n');
+    await db.update(leads).set({
+      lastDisposition: body.disposition,
+      ...(blob && { notes: sql`COALESCE(${leads.notes} || E'\n\n', '') || ${`[${ts}] ${body.disposition}\n${blob}`}` }),
+    }).where(eq(leads.id, call.leadId));
+  }
+
+  // Callback Scheduled disposition + callbackTime → follow-up todo
+  if (body.callbackTime && call?.leadId) {
+    const due = new Date(body.callbackTime);
+    if (!isNaN(due.getTime())) {
+      await db.insert(followUpTodos).values({
+        tenantId,
+        agentId: userId,
+        leadId: call.leadId,
+        leadName: call.calleeName,
+        leadPhone: call.calleeNumber,
+        reason: body.disposition,
+        dueDate: due,
+      });
+    }
+  }
+
   await db.update(users).set({
     status: 'available',
     statusChangedAt: new Date(),

@@ -240,16 +240,14 @@ export function startESLEventListener() {
                 let nextAttemptAt: Date | null = null;
 
                 if (isSuccess) {
-                  leadStatus = 'called';
+                  leadStatus = 'completed';
                 } else if (permanentFailCauses.includes(hangupCause)) {
-                  leadStatus = 'failed';
+                  leadStatus = 'skipped';
                 } else if (isRetryable && !exhausted) {
-                  // Reset to pending for retry with a delay
-                  leadStatus = 'pending';
-                  nextAttemptAt = new Date(Date.now() + 60 * 1000); // retry after 60s
+                  leadStatus = 'retry';
+                  nextAttemptAt = new Date(Date.now() + 60 * 1000);
                 } else {
-                  // Exhausted retries or unknown cause
-                  leadStatus = exhausted ? 'failed' : 'failed';
+                  leadStatus = 'skipped';
                 }
 
                 await db.update(leads).set({
