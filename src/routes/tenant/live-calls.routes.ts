@@ -1,18 +1,27 @@
 import { Hono } from 'hono';
+import { z } from 'zod';
 import { inArray, and, eq, desc, count, isNull } from 'drizzle-orm';
 import { db } from '../../db/client';
 import { calls, users, campaigns } from '../../db/schema';
-import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
+import { paginatedResponse } from '../../lib/pagination';
 import { NotFound } from '../../lib/errors';
 import { requireRole } from '../../middleware/roles';
 
 const router = new Hono();
 
+// Live monitoring needs a wider window than the standard 50-row paginator.
+// 2000 matches FS max-sessions ceiling, so the UI never silently truncates.
+const liveListSchema = z.object({
+  page: z.coerce.number().min(1).default(1),
+  limit: z.coerce.number().min(1).max(2000).default(2000),
+});
+
 // List active calls scoped to this tenant
 router.get('/', requireRole('tenant_admin', 'supervisor'), async (c) => {
   const tenantId = c.get('tenantId')!;
-  const raw = paginationSchema.parse(c.req.query());
-  const { offset, limit } = paginate(raw);
+  const raw = liveListSchema.parse(c.req.query());
+  const offset = (raw.page - 1) * raw.limit;
+  const limit = raw.limit;
 
   const where = and(
     eq(calls.tenantId, tenantId),
@@ -49,7 +58,7 @@ router.get('/', requireRole('tenant_admin', 'supervisor'), async (c) => {
     db.select({ total: count() }).from(calls).where(where),
   ]);
 
-  return c.json(paginatedResponse(rows, Number(total), raw));
+  return c.json(paginatedResponse(rows, Number(total), { ...raw, order: 'desc' }));
 });
 
 // Listen/Whisper/Barge require ESL eavesdrop wiring not yet built.
