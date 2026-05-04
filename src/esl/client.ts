@@ -87,9 +87,33 @@ export class ESLClient extends EventEmitter {
         const body = this.buffer.slice(bodyStart, totalNeeded);
         this.buffer = this.buffer.slice(totalNeeded);
 
-        // For event-plain, the body contains the actual event headers
+        // For event-plain, the body has its own headers + optional inner body
+        // (Content-Length nested). BACKGROUND_JOB events carry the bgapi reply
+        // ("+OK <uuid>" / "-ERR <reason>") in that inner body.
         if (contentType === 'text/event-plain') {
-          const eventHeaders = this.parseHeaders(body);
+          const innerHeaderEnd = body.indexOf('\n\n');
+          let eventHeaders: Record<string, string>;
+          let eventBody = '';
+          if (innerHeaderEnd === -1) {
+            eventHeaders = this.parseHeaders(body);
+          } else {
+            eventHeaders = this.parseHeaders(body.slice(0, innerHeaderEnd));
+            const innerLen = parseInt(eventHeaders['Content-Length'] ?? '0', 10);
+            if (innerLen > 0) {
+              eventBody = body.slice(innerHeaderEnd + 2, innerHeaderEnd + 2 + innerLen);
+            }
+          }
+          // Resolve any pending bgapi job before fanning the event out.
+          if (eventHeaders['Event-Name'] === 'BACKGROUND_JOB' && eventHeaders['Job-UUID']) {
+            const jobUuid = eventHeaders['Job-UUID'];
+            const pending = this.pendingJobs.get(jobUuid);
+            if (pending) {
+              clearTimeout(pending.timer);
+              this.pendingJobs.delete(jobUuid);
+              const trimmed = eventBody.trim();
+              pending.cb(trimmed.startsWith('+OK'), trimmed);
+            }
+          }
           this.emit('event', eventHeaders);
         } else if (contentType === 'api/response') {
           this.emit('api/response', body.trim());
@@ -134,9 +158,32 @@ export class ESLClient extends EventEmitter {
     this.send(`api ${command}`);
   }
 
-  bgapi(command: string): void {
-    logger.info({ command }, '[ESL] bgapi');
-    this.send(`bgapi ${command}`);
+  // Track outstanding bgapi jobs so the BACKGROUND_JOB event can fire the
+  // caller's callback. Without this, failed originates leak as orphan CDRs.
+  private pendingJobs = new Map<string, {
+    cb: (success: boolean, body: string) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
+
+  bgapi(command: string, callback?: (success: boolean, body: string) => void): string {
+    const jobUuid = crypto.randomUUID();
+    if (callback) {
+      const timer = setTimeout(() => {
+        if (this.pendingJobs.delete(jobUuid)) {
+          callback(false, '-ERR BGAPI_TIMEOUT');
+        }
+      }, 30_000);
+      this.pendingJobs.set(jobUuid, { cb: callback, timer });
+    }
+    // Pass a Job-UUID header so FS includes it in the BACKGROUND_JOB event,
+    // letting us correlate the async reply back to this specific bgapi call.
+    if (!this.socket) {
+      logger.warn({ command }, 'ESL no socket, dropping bgapi');
+      callback?.(false, '-ERR ESL_NOT_CONNECTED');
+      return jobUuid;
+    }
+    this.socket.write(`bgapi ${command}\nJob-UUID: ${jobUuid}\n\n`);
+    return jobUuid;
   }
 
   isConnected(): boolean {

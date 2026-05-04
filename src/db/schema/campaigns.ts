@@ -17,7 +17,7 @@ export const campaigns = pgTable('campaigns', {
   rateCardId: uuid('rate_card_id'),
   scriptId: uuid('script_id'),
   // Dialer
-  dialRatio: numeric('dial_ratio', { precision: 4, scale: 2 }).default('1.0'),
+  dialRatio: numeric('dial_ratio', { precision: 6, scale: 2 }).default('1.0'),
   maxAbandonRate: numeric('max_abandon_rate', { precision: 5, scale: 2 }).default('3.0'),
   wrapUpSeconds: integer('wrap_up_seconds').default(30),
   ringTimeoutSeconds: integer('ring_timeout_seconds').default(25),

@@ -430,8 +430,31 @@ async function dialLoop(state: DialerState) {
           .map(gw => `sofia/gateway/${gw}/${lead.phone}`)
           .join('|');
         const cmd = `originate {${vars}}${dialString} &bridge(user/${agentExtFs})`;
-        logger.info({ cmd, callId: call.id, gateways }, 'ESL originate for campaign call');
-        eslClient.bgapi(cmd);
+        // Async bgapi: when FS replies (with the BACKGROUND_JOB event), settle
+        // the CDR. On +OK, link the FS UUID. On -ERR, mark the CDR failed
+        // immediately (no more 30s orphan window) and free the agent + lead.
+        eslClient.bgapi(cmd, async (success, body) => {
+          try {
+            if (success) {
+              const fsUuid = body.replace(/^\+OK\s*/, '').trim();
+              if (fsUuid) {
+                await db.update(calls).set({ freeswitchUuid: fsUuid })
+                  .where(and(eq(calls.id, call.id), isNull(calls.freeswitchUuid)));
+              }
+            } else {
+              const cause = body.replace(/^-ERR\s*/, '').trim() || 'ORIGINATE_FAILED';
+              await db.update(calls).set({
+                status: 'failed',
+                hangupCause: cause,
+                endedAt: new Date(),
+              }).where(and(eq(calls.id, call.id), eq(calls.status, 'ringing')));
+              await db.update(leads).set({ status: 'skipped' }).where(eq(leads.id, lead.id));
+              // Don't auto-flip the agent — they may still have other lines in this fan-out.
+            }
+          } catch (err) {
+            logger.warn({ err, callId: call.id }, '[bgapi cb] failed to settle CDR');
+          }
+        });
       } else {
         // FreeSWITCH not connected — mark call as failed
         logger.error({ callId: call.id }, 'FreeSWITCH not connected, marking call as failed');
@@ -473,13 +496,16 @@ async function dialLoop(state: DialerState) {
         assignedAgentId: agent.id,
       }).where(eq(leads.id, lead.id));
 
-      // Set agent to on_call
-      await db.update(users).set({
-        status: 'on_call',
-        statusChangedAt: new Date(),
-      }).where(eq(users.id, agent.id));
-
       logger.info({ campaignId: state.campaignId, leadId: lead.id, phone: lead.phone, agentId: agent.id, callId: call.id }, 'Campaign: dialing lead');
+    }
+
+    // Flip every agent we just dispatched calls to → on_call, in a single
+    // statement. With ratio=1000 this used to fire 1000 redundant per-call
+    // updates against the same agent row.
+    const dispatchedAgentIds = Array.from(new Set(leadsToCall.slice(0, availableAgents.length === 0 ? 0 : leadsToCall.length).map((_, i) => availableAgents[i % availableAgents.length].id)));
+    if (dispatchedAgentIds.length > 0) {
+      await db.update(users).set({ status: 'on_call', statusChangedAt: new Date() })
+        .where(inArray(users.id, dispatchedAgentIds));
     }
   } catch (err) {
     logger.error({ campaignId: state.campaignId, err }, 'Dialer loop error');
