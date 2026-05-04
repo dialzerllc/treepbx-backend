@@ -48,6 +48,11 @@ async function main() {
   const { startCarrierHealthCheck } = await import('./esl/health-check');
   startCarrierHealthCheck();
 
+  // Global call sweeper — clears stale ringing/answered CDRs so the Live
+  // Calls UI never shows ghosts when no campaign is ticking.
+  const { startGlobalCallSweeper } = await import('./esl/sweeper');
+  startGlobalCallSweeper();
+
   // Autoscaler loop (runs every 30s; no-op unless autoscaler_enabled=true in platform_settings)
   {
     const { runAutoscalerTick } = await import('./autoscaler');
