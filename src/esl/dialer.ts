@@ -288,11 +288,32 @@ async function dialLoop(state: DialerState) {
 
     const ringTimeout = campaign?.ringTimeoutSeconds ?? 25;
 
+    // Tenant-level caller ID fallback (first DID owned by the tenant) for
+    // when the campaign has no DID group configured. Resolved once per loop,
+    // not per call. Without this we used to fall through to agent.sipUsername
+    // (extension number) — carriers reject those as invalid caller IDs.
+    let tenantFallbackCid: string | null = null;
+    if (!outboundCallerId) {
+      const [tenantDid] = await db.select({ number: dids.number, id: dids.id })
+        .from(dids)
+        .where(and(eq(dids.tenantId, state.tenantId), eq(dids.active, true)))
+        .orderBy(asc(dids.createdAt))
+        .limit(1);
+      if (tenantDid) {
+        tenantFallbackCid = tenantDid.number;
+        if (!outboundDidId) outboundDidId = tenantDid.id;
+      }
+    }
+
     for (let i = 0; i < leadsToCall.length && i < availableAgents.length; i++) {
       const lead = leadsToCall[i];
       const agent = availableAgents[i];
 
-      const effectiveCallerId = outboundCallerId || agent.sipUsername || agent.id;
+      const effectiveCallerId = outboundCallerId || tenantFallbackCid;
+      if (!effectiveCallerId) {
+        logger.warn({ campaignId: state.campaignId, leadId: lead.id }, 'Skipping dial — no caller ID available (campaign has no DID group AND tenant has no active DIDs)');
+        continue;
+      }
       const callerName = `${agent.firstName} ${agent.lastName}`.trim();
 
       // Create CDR

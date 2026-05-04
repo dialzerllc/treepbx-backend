@@ -209,6 +209,51 @@ router.post('/', async (c) => {
   return c.json(row, 201);
 });
 
+// Bulk import — accepts an array of DID numbers + a groupId. Single DB
+// round-trip with onConflictDoNothing on the unique number column, so
+// re-uploads of the same CSV give accurate created/skipped counts instead of
+// hanging the browser with N sequential POSTs.
+router.post('/bulk-import', async (c) => {
+  const body = z.object({
+    numbers: z.array(z.string().min(1)).min(1).max(10000),
+    groupId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
+    country: z.string().default('US'),
+    didType: z.enum(['local', 'tollfree', 'mobile']).default('local'),
+    provider: z.string().default('unspecified'),
+  }).parse(await c.req.json());
+
+  let groupId = body.groupId;
+  if (!groupId) {
+    const [defaultGroup] = await db.select({ id: platformDidGroups.id })
+      .from(platformDidGroups).where(eq(platformDidGroups.isDefault, true)).limit(1);
+    if (defaultGroup) groupId = defaultGroup.id;
+  }
+
+  // Dedupe within the upload itself, then insert with onConflictDoNothing on
+  // the unique `number` index so existing DIDs are silently skipped.
+  const uniqueNumbers = Array.from(new Set(body.numbers.map((n) => n.trim()).filter(Boolean)));
+  const values = uniqueNumbers.map((number) => ({
+    number,
+    groupId,
+    status: 'available' as const,
+    country: body.country,
+    didType: body.didType,
+    provider: body.provider,
+  }));
+
+  const inserted = values.length > 0
+    ? await db.insert(platformDids).values(values).onConflictDoNothing().returning({ id: platformDids.id })
+    : [];
+
+  return c.json({
+    ok: true,
+    submitted: body.numbers.length,
+    deduped: uniqueNumbers.length,
+    created: inserted.length,
+    skipped: uniqueNumbers.length - inserted.length,
+  });
+});
+
 router.put('/:id', async (c) => {
   const body = didSchema.partial().parse(await c.req.json());
   // If status set to available, clear tenant assignment
