@@ -283,10 +283,11 @@ export function startESLEventListener() {
 
             // AMD result — set by execute_on_avmd_beep when mod_avmd detects
             // voicemail. If the channel ran AMD but never tripped, infer
-            // 'human' from a non-trivial billsec on a connected call.
+            // 'human' from a non-trivial billsec on a normally-cleared call.
             const ranAmd = headers['variable_avmd-inbound-channel'] === 'true';
+            const hangupCauseLocal = headers['variable_hangup_cause'] || headers['Hangup-Cause'] || '';
             const amdResult = headers['variable_amd_result']
-              ?? (ranAmd && hangupCause === 'NORMAL_CLEARING' && billSec > 5 ? 'human' : null);
+              ?? (ranAmd && hangupCauseLocal === 'NORMAL_CLEARING' && billSec > 5 ? 'human' : null);
 
             logger.info({ uuid, duration, billSec, codec, carrier, mos, amdResult }, '[ESL] HANGUP_COMPLETE details');
 

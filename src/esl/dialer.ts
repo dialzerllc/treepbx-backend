@@ -1,6 +1,6 @@
 import { eq, and, sql, lte, isNull, inArray, asc } from 'drizzle-orm';
 import { db } from '../db/client';
-import { campaigns, leads, calls, users, byocCarriers, dids, carriers } from '../db/schema';
+import { campaigns, leads, calls, users, byocCarriers, dids, didGroups, carriers } from '../db/schema';
 import { sendToAgent } from '../ws/rooms';
 import { eslClient } from './client';
 import { logger } from '../lib/logger';
@@ -14,6 +14,10 @@ interface DialerState {
   leadListIds: string[];
   leadListStrategy: string;
   roundRobinIndex: number;
+  // Caller-ID rotation cursor — incremented per-call for round_robin/sequential.
+  // In-memory only; resets when the dialer restarts (acceptable; rotation is
+  // for SHAKEN/spam-likely mitigation, not strict fairness).
+  didCallerIdIndex: number;
   interval: ReturnType<typeof setInterval> | null;
 }
 
@@ -35,6 +39,7 @@ export async function startCampaignDialer(campaignId: string) {
     leadListIds: listIds.length > 0 ? listIds : (campaign.leadListId ? [campaign.leadListId] : []),
     leadListStrategy: (campaign as any).leadListStrategy ?? 'sequential',
     roundRobinIndex: 0,
+    didCallerIdIndex: 0,
     interval: null,
   };
 
@@ -212,23 +217,62 @@ async function dialLoop(state: DialerState) {
       byocRouting: campaigns.byocRouting,
       ringTimeoutSeconds: campaigns.ringTimeoutSeconds,
       rateCardId: campaigns.rateCardId,
+      callerIdRotation: campaigns.callerIdRotation,
       amdEnabled: campaigns.amdEnabled,
       amdAction: campaigns.amdAction,
       amdTimeoutMs: campaigns.amdTimeoutMs,
       amdTransferTarget: campaigns.amdTransferTarget,
     }).from(campaigns).where(eq(campaigns.id, state.campaignId));
 
-    // Pick a DID for caller ID if a DID group is configured
-    let outboundCallerId: string | null = null;
-    let outboundDidId: string | null = null;
+    // Caller-ID DID pool — when the campaign has a DID group, fetch every
+    // active DID in the group (ordered by created_at for stable round-robin)
+    // and rotate through them per-lead. Resolution per lead happens inside
+    // the dial loop using `pickDidForLead` below.
+    let groupDids: { id: string; number: string }[] = [];
+    let groupCallerIdStrategy: string = 'fixed';
     if (campaign?.didGroupId) {
-      const [did] = await db.select({ id: dids.id, number: dids.number })
+      groupDids = await db.select({ id: dids.id, number: dids.number })
         .from(dids)
         .where(and(eq(dids.didGroupId, campaign.didGroupId), eq(dids.active, true)))
-        .limit(1);
-      if (did) {
-        outboundCallerId = did.number;
-        outboundDidId = did.id;
+        .orderBy(asc(dids.createdAt));
+      const [grp] = await db.select({ callerIdStrategy: didGroups.callerIdStrategy })
+        .from(didGroups).where(eq(didGroups.id, campaign.didGroupId));
+      if (grp?.callerIdStrategy) groupCallerIdStrategy = grp.callerIdStrategy;
+    }
+
+    // Effective rotation: campaign override wins unless 'use_group_default'.
+    // Frontend values: round_robin | sequential | random | local_match | use_group_default
+    const camp = campaign?.callerIdRotation;
+    const effectiveStrategy =
+      camp && camp !== 'use_group_default'
+        ? camp
+        : (groupCallerIdStrategy === 'fixed' ? 'fixed' : groupCallerIdStrategy);
+
+    function pickDidForLead(leadPhone: string): { id: string; number: string } | null {
+      if (groupDids.length === 0) return null;
+      switch (effectiveStrategy) {
+        case 'random':
+          return groupDids[Math.floor(Math.random() * groupDids.length)];
+        case 'local_match': {
+          // North-American area code: digit 1 (after +1) through 3.
+          // For E.164 +1AAANNNXXXX → AAA = leadPhone.slice(2,5).
+          const digits = leadPhone.replace(/\D/g, '');
+          const npa = digits.startsWith('1') ? digits.slice(1, 4) : digits.slice(0, 3);
+          const match = groupDids.find((d) => {
+            const dd = d.number.replace(/\D/g, '');
+            const dnpa = dd.startsWith('1') ? dd.slice(1, 4) : dd.slice(0, 3);
+            return dnpa === npa;
+          });
+          if (match) return match;
+          // Fall through to round-robin if no area-code match.
+          return groupDids[state.didCallerIdIndex++ % groupDids.length];
+        }
+        case 'round_robin':
+        case 'sequential':
+          return groupDids[state.didCallerIdIndex++ % groupDids.length];
+        case 'fixed':
+        default:
+          return groupDids[0];
       }
     }
 
@@ -292,32 +336,32 @@ async function dialLoop(state: DialerState) {
 
     const ringTimeout = campaign?.ringTimeoutSeconds ?? 25;
 
-    // Tenant-level caller ID fallback (first DID owned by the tenant) for
-    // when the campaign has no DID group configured. Resolved once per loop,
-    // not per call. Without this we used to fall through to agent.sipUsername
-    // (extension number) — carriers reject those as invalid caller IDs.
-    let tenantFallbackCid: string | null = null;
-    if (!outboundCallerId) {
+    // Tenant-level fallback (single DID) for when the campaign has no DID
+    // group configured. The campaign-DID-group path uses pickDidForLead(),
+    // which already returns null when the group is empty.
+    let tenantFallback: { id: string; number: string } | null = null;
+    if (groupDids.length === 0) {
       const [tenantDid] = await db.select({ number: dids.number, id: dids.id })
         .from(dids)
         .where(and(eq(dids.tenantId, state.tenantId), eq(dids.active, true)))
         .orderBy(asc(dids.createdAt))
         .limit(1);
-      if (tenantDid) {
-        tenantFallbackCid = tenantDid.number;
-        if (!outboundDidId) outboundDidId = tenantDid.id;
-      }
+      if (tenantDid) tenantFallback = tenantDid;
     }
 
     for (let i = 0; i < leadsToCall.length && i < availableAgents.length; i++) {
       const lead = leadsToCall[i];
       const agent = availableAgents[i];
 
-      const effectiveCallerId = outboundCallerId || tenantFallbackCid;
-      if (!effectiveCallerId) {
-        logger.warn({ campaignId: state.campaignId, leadId: lead.id }, 'Skipping dial — no caller ID available (campaign has no DID group AND tenant has no active DIDs)');
+      // Resolve the caller-ID DID per lead so rotation/local-match actually
+      // varies between calls in the same loop tick.
+      const pickedDid = pickDidForLead(lead.phone) ?? tenantFallback;
+      if (!pickedDid) {
+        logger.warn({ campaignId: state.campaignId, leadId: lead.id }, 'Skipping dial — no caller ID available (DID group empty AND tenant has no active DIDs)');
         continue;
       }
+      const effectiveCallerId = pickedDid.number;
+      const outboundDidId = pickedDid.id;
       const callerName = `${agent.firstName} ${agent.lastName}`.trim();
 
       // Create CDR
