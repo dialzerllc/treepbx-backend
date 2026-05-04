@@ -2,11 +2,24 @@ import Anthropic from '@anthropic-ai/sdk';
 
 let client: Anthropic | null = null;
 
+// Two auth paths supported. ANTHROPIC_AUTH_TOKEN (OAuth access token from
+// claude.ai / Claude Code subscription) takes precedence — it ties calls to
+// the Max plan rate limits and requires the oauth beta header. Falls back to
+// ANTHROPIC_API_KEY (prepaid credits) when no OAuth token is set.
 export function getClaude(): Anthropic {
   if (!client) {
+    const authToken = process.env.ANTHROPIC_AUTH_TOKEN;
     const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) throw new Error('ANTHROPIC_API_KEY not set in environment');
-    client = new Anthropic({ apiKey });
+    if (authToken) {
+      client = new Anthropic({
+        authToken,
+        defaultHeaders: { 'anthropic-beta': 'oauth-2025-04-20' },
+      });
+    } else if (apiKey) {
+      client = new Anthropic({ apiKey });
+    } else {
+      throw new Error('Neither ANTHROPIC_AUTH_TOKEN nor ANTHROPIC_API_KEY set');
+    }
   }
   return client;
 }
