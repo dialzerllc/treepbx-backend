@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { eq, and, like, desc, count, inArray, sql } from 'drizzle-orm';
 import { db } from '../../db/client';
-import { dids, didGroups, byocCarriers, platformDids, platformDidGroups, agentDids, stirDidAttestations } from '../../db/schema';
+import { dids, didGroups, byocCarriers, platformDids, platformDidGroups, agentDids, stirDidAttestations, ivrMenus, teams, queues, users } from '../../db/schema';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
 import { NotFound, BadRequest } from '../../lib/errors';
 import { requireRole } from '../../middleware/roles';
@@ -35,6 +35,53 @@ const didGroupSchema = z.object({
   defaultRoute: z.string().nullable().optional(),
   callerIdStrategy: z.enum(['fixed', 'random', 'local_match']).default('fixed'),
 });
+
+// Frontend stores route as a combined string ("IVR: Main Menu", "Queue: Sales",
+// "Voicemail", "None"…). Backend needs (routeType, routeTargetId). This resolver
+// looks up the target by name within the tenant's IVRs / teams / agents and
+// returns the persisted shape. Returns null target for type-only routes
+// (Voicemail, External, None).
+async function resolveRoute(combined: string | undefined, tenantId: string): Promise<{ routeType: string; routeTargetId: string | null } | null> {
+  if (!combined) return null;
+  const trimmed = combined.trim();
+  if (!trimmed || trimmed === 'None') return { routeType: 'none', routeTargetId: null };
+  if (trimmed === 'Voicemail') return { routeType: 'voicemail', routeTargetId: null };
+  if (trimmed === 'External') return { routeType: 'external', routeTargetId: null };
+
+  const colonIdx = trimmed.indexOf(':');
+  if (colonIdx < 0) return { routeType: trimmed.toLowerCase(), routeTargetId: null };
+  const typeRaw = trimmed.slice(0, colonIdx).trim().toLowerCase();
+  const targetName = trimmed.slice(colonIdx + 1).trim();
+  if (!targetName) return { routeType: typeRaw, routeTargetId: null };
+
+  let targetId: string | null = null;
+  if (typeRaw === 'ivr') {
+    const [m] = await db.select({ id: ivrMenus.id }).from(ivrMenus)
+      .where(and(eq(ivrMenus.tenantId, tenantId), eq(ivrMenus.name, targetName)));
+    targetId = m?.id ?? null;
+  } else if (typeRaw === 'queue' || typeRaw === 'team') {
+    // Try queues first, fall back to teams (UI sometimes labels Team:)
+    const [q] = await db.select({ id: queues.id }).from(queues)
+      .where(and(eq(queues.tenantId, tenantId), eq(queues.name, targetName)));
+    if (q) targetId = q.id;
+    else {
+      const [t] = await db.select({ id: teams.id }).from(teams)
+        .where(and(eq(teams.tenantId, tenantId), eq(teams.name, targetName)));
+      targetId = t?.id ?? null;
+    }
+  } else if (typeRaw === 'agent') {
+    // Match by SIP username first (stable), fall back to "First Last" full name
+    const [u] = await db.select({ id: users.id }).from(users)
+      .where(and(eq(users.tenantId, tenantId), eq(users.sipUsername, targetName)));
+    if (u) targetId = u.id;
+    else {
+      const allAgents = await db.select({ id: users.id, firstName: users.firstName, lastName: users.lastName })
+        .from(users).where(eq(users.tenantId, tenantId));
+      targetId = allAgents.find(a => `${a.firstName ?? ''} ${a.lastName ?? ''}`.trim() === targetName)?.id ?? null;
+    }
+  }
+  return { routeType: typeRaw === 'team' ? 'queue' : typeRaw, routeTargetId: targetId };
+}
 
 const byocSchema = z.object({
   name: z.string().min(1),
@@ -103,10 +150,35 @@ router.get('/', async (c) => {
   const platGroups = await db.select({ id: platformDidGroups.id, name: platformDidGroups.name }).from(platformDidGroups);
   const groupMap = new Map([...tenantGroups, ...platGroups].map((g) => [g.id, g.name]));
 
-  // Enrich with group name
+  // Build route-target name lookups for IVR / Queue / Team / Agent so the
+  // enriched DID rows can carry a display-ready `route` string ("IVR: Main").
+  const targetIds = tenantDids.map(d => d.routeTargetId).filter((id): id is string => !!id);
+  const [ivrRows, queueRows, teamRows, agentRows] = targetIds.length > 0 ? await Promise.all([
+    db.select({ id: ivrMenus.id, name: ivrMenus.name }).from(ivrMenus).where(and(eq(ivrMenus.tenantId, tenantId), inArray(ivrMenus.id, targetIds))),
+    db.select({ id: queues.id, name: queues.name }).from(queues).where(and(eq(queues.tenantId, tenantId), inArray(queues.id, targetIds))),
+    db.select({ id: teams.id, name: teams.name }).from(teams).where(and(eq(teams.tenantId, tenantId), inArray(teams.id, targetIds))),
+    db.select({ id: users.id, firstName: users.firstName, lastName: users.lastName, sipUsername: users.sipUsername }).from(users).where(and(eq(users.tenantId, tenantId), inArray(users.id, targetIds))),
+  ]) : [[], [], [], []];
+  const targetNameMap = new Map<string, string>();
+  for (const r of ivrRows) targetNameMap.set(r.id, r.name);
+  for (const r of queueRows) targetNameMap.set(r.id, r.name);
+  for (const r of teamRows) targetNameMap.set(r.id, r.name);
+  for (const r of agentRows) targetNameMap.set(r.id, r.sipUsername || `${r.firstName ?? ''} ${r.lastName ?? ''}`.trim());
+
+  function buildRouteString(routeType: string | null, routeTargetId: string | null): string {
+    if (!routeType || routeType === 'none') return 'None';
+    if (routeType === 'voicemail') return 'Voicemail';
+    if (routeType === 'external') return 'External';
+    const label = routeType === 'ivr' ? 'IVR' : routeType === 'queue' ? 'Queue' : routeType === 'agent' ? 'Agent' : routeType;
+    const targetName = routeTargetId ? targetNameMap.get(routeTargetId) : null;
+    return targetName ? `${label}: ${targetName}` : label;
+  }
+
+  // Enrich with group name + display-ready route string
   const enrichedTenant = tenantDids.map((d) => ({
     ...d,
     group: d.didGroupId ? groupMap.get(d.didGroupId) ?? null : null,
+    route: buildRouteString(d.routeType, d.routeTargetId),
   }));
   const enrichedPlatform = platformAsDids.map((pd) => {
     const origDid = assignedPlatformDids.find((d) => d.id === pd.id);
@@ -252,9 +324,11 @@ router.post('/bulk/route', requireRole('tenant_admin'), async (c) => {
     repeatCallerMaxCalls: z.coerce.number().int().optional(),
   }).parse(await c.req.json());
 
+  const resolved = await resolveRoute(body.route, tenantId);
   await db.update(dids)
     .set({
-      routeType: body.route,
+      routeType: resolved?.routeType ?? 'none',
+      routeTargetId: resolved?.routeTargetId ?? null,
       unknownCallerRoute: body.unknownCallerRoute,
       repeatCallerRoute: body.repeatCallerRoute,
     })
@@ -576,10 +650,24 @@ router.post('/', requireRole('tenant_admin'), async (c) => {
 router.put('/:id', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const didId = c.req.param('id');
-  const body = didSchema.partial().omit({ number: true }).passthrough().parse(await c.req.json());
+  const rawBody = await c.req.json();
+  const body = didSchema.partial().omit({ number: true }).passthrough().parse(rawBody);
+
+  // FE sends `route` (combined "Type: Target" string). Resolve to
+  // (routeType, routeTargetId) so it can be persisted on the row directly.
+  if (typeof rawBody?.route === 'string' && rawBody.route.length > 0) {
+    const resolved = await resolveRoute(rawBody.route, tenantId);
+    if (resolved) {
+      (body as any).routeType = resolved.routeType;
+      (body as any).routeTargetId = resolved.routeTargetId;
+    }
+  }
+  // Strip any non-column keys before db.update — Drizzle is lenient but it
+  // documents intent that these aren't persisted.
+  const { route: _route, routeTarget: _routeTarget, ...persistable } = body as any;
 
   // Try tenant DID first
-  const [row] = await db.update(dids).set(body)
+  const [row] = await db.update(dids).set(persistable)
     .where(and(eq(dids.id, didId), eq(dids.tenantId, tenantId)))
     .returning();
 
