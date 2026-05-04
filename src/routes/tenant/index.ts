@@ -18,6 +18,7 @@ import audioRouter from './audio.routes';
 import voicebotRouter from './voicebot.routes';
 import stirShakenRouter from './stir-shaken.routes';
 import monitoringRouter from './monitoring.routes';
+import liveCallsRouter from './live-calls.routes';
 import reportsRouter from './reports.routes';
 import metricsRouter from './metrics.routes';
 import callTraceRouter from './call-trace.routes';
@@ -66,6 +67,7 @@ tenant.route('/stir-shaken', stirShakenRouter);
 
 // Monitoring (supervisor/admin — enforced inside routes)
 tenant.route('/monitoring', monitoringRouter);
+tenant.route('/live-calls', liveCallsRouter);
 
 // Reports (supervisor/admin — enforced inside routes)
 tenant.route('/reports', reportsRouter);

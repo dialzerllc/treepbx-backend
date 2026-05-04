@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { optionalUuid } from '../../lib/zod-helpers';
-import { inArray, and, eq, desc, count } from 'drizzle-orm';
+import { inArray, and, eq, desc, count, isNull } from 'drizzle-orm';
 import { db } from '../../db/client';
 import { calls } from '../../db/schema';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
@@ -16,7 +16,10 @@ router.get('/', async (c) => {
   const { offset, limit } = paginate(raw);
 
   const activeStatuses = ['ringing', 'answered'];
-  const conditions: ReturnType<typeof eq>[] = [inArray(calls.status, activeStatuses) as any];
+  const conditions: ReturnType<typeof eq>[] = [
+    inArray(calls.status, activeStatuses) as any,
+    isNull(calls.endedAt) as any,
+  ];
   if (raw.tenantId) conditions.push(eq(calls.tenantId, raw.tenantId) as any);
   const where = and(...conditions);
 
