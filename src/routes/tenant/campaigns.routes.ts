@@ -735,6 +735,19 @@ router.put('/:id', requireRole('tenant_admin'), async (c) => {
   if (!row) throw new NotFound('Campaign not found');
   const { cacheDelPattern } = await import('../../lib/redis');
   await cacheDelPattern(`campaigns:${tenantId}*`);
+
+  // Sync dialer state if status field was touched. Without this, saving the
+  // form with status='running' silently leaves the dialer stopped because
+  // only the dedicated /status route was wiring start/stop before.
+  if ('status' in updateData) {
+    const { startCampaignDialer, stopCampaignDialer } = await import('../../esl/dialer');
+    if (row.status === 'running' || row.status === 'active') {
+      startCampaignDialer(row.id);
+    } else {
+      stopCampaignDialer(row.id);
+    }
+  }
+
   return c.json(row);
 });
 
