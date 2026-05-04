@@ -86,6 +86,61 @@ router.delete('/errors/:id', requireRole('super_admin'), async (c) => {
   return c.json({ ok: true });
 });
 
+// Issue a single-use ticket for the debug terminal WS. Ticket carries the
+// bug context so the spawned claude session on dev01 starts with the prompt
+// already buffered. 30-second TTL — the WS must connect immediately.
+router.post('/errors/:id/terminal-ticket', requireRole('super_admin'), async (c) => {
+  const [row] = await db.select({
+    level: errorLog.level,
+    method: errorLog.method,
+    path: errorLog.path,
+    statusCode: errorLog.statusCode,
+    errType: errorLog.errType,
+    errMessage: errorLog.errMessage,
+    stack: errorLog.stack,
+    context: errorLog.context,
+    userEmail: users.email,
+    createdAt: errorLog.createdAt,
+  }).from(errorLog)
+    .leftJoin(users, eq(errorLog.userId, users.id))
+    .where(eq(errorLog.id, c.req.param('id')));
+  if (!row) return c.json({ error: 'Error not found' }, 404);
+
+  const lines: string[] = [];
+  lines.push(`Captured error from production debugger — investigate and fix:`);
+  lines.push('');
+  lines.push(`Endpoint: ${row.method ?? '-'} ${row.path ?? '-'} → ${row.statusCode ?? '-'}`);
+  if (row.errType) lines.push(`Type: ${row.errType}`);
+  lines.push(`Message: ${row.errMessage}`);
+  if (row.stack) {
+    lines.push('');
+    lines.push('Stack:');
+    lines.push(row.stack.slice(0, 3000));
+  }
+  if (row.context && Object.keys(row.context as object).length > 0) {
+    lines.push('');
+    lines.push('Context:');
+    lines.push(JSON.stringify(row.context, null, 2).slice(0, 1500));
+  }
+  if (row.userEmail) lines.push(`Affected user: ${row.userEmail}`);
+  lines.push('');
+  lines.push('The backend source lives at /tmp/tb-be (current working directory).');
+  lines.push('Find the root cause, propose a patch, ask before editing.');
+
+  const ticket = crypto.randomUUID();
+  const userId = c.get('user').sub;
+  const role = c.get('user').role;
+  const { redis } = await import('../lib/redis');
+  await redis.set(
+    `debugterm:${ticket}`,
+    JSON.stringify({ userId, role, errorContext: lines.join('\n') }),
+    'EX',
+    30,
+  );
+
+  return c.json({ ticket });
+});
+
 // Analyze a captured error with Claude — produces a root-cause hypothesis +
 // suggested fix. Super-admin only because it sends error details (which can
 // contain stack traces with internal paths) to a third-party API.

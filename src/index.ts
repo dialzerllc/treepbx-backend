@@ -4,7 +4,7 @@ import { initKeys } from './lib/jwt';
 import { logger } from './lib/logger';
 import { initSocketIO } from './lib/socketio';
 import app from './app';
-import { upgradeWebSocket, wsHandler } from './ws';
+import { upgradeWebSocket, upgradeTerminalWebSocket, wsHandler } from './ws';
 import { startWorkers } from './lib/queue';
 
 async function main() {
@@ -19,6 +19,10 @@ async function main() {
       if (url.pathname === '/ws') {
         const resp = await upgradeWebSocket(req, server);
         // undefined means upgrade succeeded
+        return resp ?? new Response(null, { status: 101 });
+      }
+      if (url.pathname === '/debug-terminal') {
+        const resp = await upgradeTerminalWebSocket(req, server);
         return resp ?? new Response(null, { status: 101 });
       }
       return app.fetch(req);

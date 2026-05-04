@@ -1,10 +1,14 @@
 import type { ServerWebSocket } from 'bun';
 import type { JWTPayload } from '../lib/jwt';
+import type { TerminalWsData } from './terminal';
 
 export interface WsData {
   user: JWTPayload;
   rooms: Set<string>;
 }
+
+// Union of every connection kind handled by Bun.serve's single websocket handler.
+export type AnyWsData = WsData | TerminalWsData;
 
 // Room → set of websockets
 const rooms = new Map<string, Set<ServerWebSocket<WsData>>>();
