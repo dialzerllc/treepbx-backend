@@ -70,15 +70,12 @@ async function resolveRoute(combined: string | undefined, tenantId: string): Pro
       targetId = t?.id ?? null;
     }
   } else if (typeRaw === 'agent') {
-    // Match by SIP username first (stable), fall back to "First Last" full name
-    const [u] = await db.select({ id: users.id }).from(users)
-      .where(and(eq(users.tenantId, tenantId), eq(users.sipUsername, targetName)));
-    if (u) targetId = u.id;
-    else {
-      const allAgents = await db.select({ id: users.id, firstName: users.firstName, lastName: users.lastName })
-        .from(users).where(eq(users.tenantId, tenantId));
-      targetId = allAgents.find(a => `${a.firstName ?? ''} ${a.lastName ?? ''}`.trim() === targetName)?.id ?? null;
-    }
+    // FE option value is "First Last" — match that first, fall back to
+    // sipUsername (older entries / rare missing-name cases).
+    const allAgents = await db.select({ id: users.id, firstName: users.firstName, lastName: users.lastName, sipUsername: users.sipUsername })
+      .from(users).where(eq(users.tenantId, tenantId));
+    const byName = allAgents.find(a => `${a.firstName ?? ''} ${a.lastName ?? ''}`.trim() === targetName);
+    targetId = byName?.id ?? allAgents.find(a => a.sipUsername === targetName)?.id ?? null;
   }
   return { routeType: typeRaw === 'team' ? 'queue' : typeRaw, routeTargetId: targetId };
 }
@@ -163,7 +160,12 @@ router.get('/', async (c) => {
   for (const r of ivrRows) targetNameMap.set(r.id, r.name);
   for (const r of queueRows) targetNameMap.set(r.id, r.name);
   for (const r of teamRows) targetNameMap.set(r.id, r.name);
-  for (const r of agentRows) targetNameMap.set(r.id, r.sipUsername || `${r.firstName ?? ''} ${r.lastName ?? ''}`.trim());
+  // Match the FE Agent dropdown option format: "First Last" (falls back to
+  // sipUsername only when no name set). Mismatch = select shows blank.
+  for (const r of agentRows) {
+    const name = `${r.firstName ?? ''} ${r.lastName ?? ''}`.trim();
+    targetNameMap.set(r.id, name || r.sipUsername || r.id);
+  }
 
   function buildRouteString(routeType: string | null, routeTargetId: string | null): string {
     if (!routeType || routeType === 'none') return 'None';
