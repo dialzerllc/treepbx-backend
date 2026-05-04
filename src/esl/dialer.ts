@@ -90,16 +90,6 @@ async function dialLoop(state: DialerState) {
     state.leadListIds = freshListIds.length > 0 ? freshListIds : (freshCampaign.leadListId ? [freshCampaign.leadListId] : []);
     state.leadListStrategy = freshCampaign.leadListStrategy ?? 'sequential';
 
-    // Count available agents for this tenant
-    const [{ available }] = await db.select({
-      available: sql<number>`count(*)::int`,
-    }).from(users).where(and(
-      eq(users.tenantId, state.tenantId),
-      eq(users.status, 'available'),
-      inArray(users.role, ['agent', 'supervisor']),
-      isNull(users.deletedAt),
-    ));
-
     // Sweeper: any CDR for this campaign that's been stuck in 'ringing' with
     // no FreeSWITCH UUID for >30s is an orphan — the originate either failed
     // before FS produced a CHANNEL_CREATE event, or events.ts never linked it.
@@ -114,6 +104,32 @@ async function dialLoop(state: DialerState) {
       eq(calls.status, 'ringing'),
       isNull(calls.freeswitchUuid),
       lte(calls.startedAt, sql`NOW() - INTERVAL '30 seconds'`),
+    ));
+
+    // Heal stuck 'on_call' agents — if they have NO active CDRs, flip them
+    // back to 'available'. Failed originates leave the dialer's batch
+    // 'on_call' set behind without a real call to anchor it.
+    await db.execute(sql`
+      UPDATE users SET status = 'available', status_changed_at = NOW()
+      WHERE tenant_id = ${state.tenantId}
+        AND status = 'on_call'
+        AND role IN ('agent', 'supervisor')
+        AND deleted_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM calls c
+          WHERE c.agent_id = users.id
+            AND c.status IN ('ringing', 'answered')
+        )
+    `);
+
+    // Count available agents AFTER the heal so we don't read a stale value.
+    const [{ available }] = await db.select({
+      available: sql<number>`count(*)::int`,
+    }).from(users).where(and(
+      eq(users.tenantId, state.tenantId),
+      eq(users.status, 'available'),
+      inArray(users.role, ['agent', 'supervisor']),
+      isNull(users.deletedAt),
     ));
 
     if (available === 0) return;
