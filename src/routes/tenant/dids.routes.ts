@@ -184,16 +184,34 @@ router.post('/purchase', requireRole('tenant_admin'), async (c) => {
   return c.json(row, 201);
 });
 
-// Bulk move DIDs to a group
+// Bulk move DIDs to a group. `group` is either a did_group_id (UUID) or
+// empty/null to un-group. The previous heuristic (length > 10 → UUID) silently
+// dropped names like "CALLERID" (8 chars) and broke UI moves.
 router.post('/bulk/move', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
-  const body = z.object({ ids: z.array(z.string().uuid()), group: z.string() }).parse(await c.req.json());
+  const body = z.object({
+    ids: z.array(z.string().uuid()),
+    group: z.string().nullable().optional(),
+  }).parse(await c.req.json());
 
-  await db.update(dids)
-    .set({ didGroupId: body.group.length > 10 ? body.group : null })
-    .where(and(inArray(dids.id, body.ids), eq(dids.tenantId, tenantId)));
+  let groupId: string | null = null;
+  if (body.group && body.group.trim()) {
+    if (!/^[0-9a-f-]{36}$/i.test(body.group)) {
+      throw new BadRequest('group must be a did_group_id (UUID), not a name');
+    }
+    // Verify the group belongs to this tenant before assigning
+    const [grp] = await db.select({ id: didGroups.id }).from(didGroups)
+      .where(and(eq(didGroups.id, body.group), eq(didGroups.tenantId, tenantId)));
+    if (!grp) throw new NotFound('DID group not found');
+    groupId = body.group;
+  }
 
-  return c.json({ ok: true, updated: body.ids.length });
+  const updated = await db.update(dids)
+    .set({ didGroupId: groupId })
+    .where(and(inArray(dids.id, body.ids), eq(dids.tenantId, tenantId)))
+    .returning({ id: dids.id });
+
+  return c.json({ ok: true, updated: updated.length });
 });
 
 // Bulk delete DIDs
