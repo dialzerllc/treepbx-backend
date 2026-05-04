@@ -31,6 +31,7 @@ const campaignSchema = z.object({
     .pipe(z.number().min(0.1).max(1000))
     .transform((n) => n.toFixed(2))
     .default('1.0'),
+  multipleLines: z.coerce.number().int().min(1).max(1000).default(1),
   maxAbandonRate: z.union([z.number(), z.string()])
     .transform((v) => Number(v))
     .pipe(z.number().min(0).max(100))

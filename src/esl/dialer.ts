@@ -69,6 +69,7 @@ async function dialLoop(state: DialerState) {
       status: campaigns.status,
       dialMode: campaigns.dialMode,
       dialRatio: campaigns.dialRatio,
+      multipleLines: campaigns.multipleLines,
       leadListId: campaigns.leadListId,
       leadListIds: campaigns.leadListIds,
       retryFailedLeads: campaigns.retryFailedLeads,
@@ -117,11 +118,14 @@ async function dialLoop(state: DialerState) {
 
     if (available === 0) return;
 
-    // Lines per tick = dial_ratio × available_agents. Preview mode is the
-    // exception (always 1, agent reviews before dialing).
+    // Lines per tick = dial_ratio × multiple_lines (both user-set on the
+    // campaign form). Decouples the fan-out target from agent count so the
+    // dialer can pump as hard as the carrier allows. Preview mode is still
+    // pinned at 1 by definition.
+    const multipleLines = freshCampaign.multipleLines ?? 1;
     const linesToDial = state.dialMode === 'preview'
       ? 1
-      : Math.ceil(available * state.dialRatio);
+      : Math.ceil(state.dialRatio * multipleLines);
 
     // Count active calls for this campaign
     const [{ active }] = await db.select({
