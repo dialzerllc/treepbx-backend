@@ -15,11 +15,11 @@ const DEV01_HOST = process.env.DEV01_HOST ?? '87.99.129.252';
 const DEV01_USER = process.env.DEV01_USER ?? 'tpbx';
 const DEV01_KEY = process.env.DEV01_TERMINAL_KEY_PATH ?? '/opt/tpbx/secrets/dev01_terminal_key';
 
-// Spawn an interactive claude session inside a tmpdir under /tmp/tb-be (the
-// dev01 backend source). Claude can edit files there; the user runs the
-// deploy script when ready. -lc gives a login shell so PATH includes
-// ~/.local/bin where claude lives.
-const SHELL_CMD = 'cd /tmp/tb-be && exec bash -lc "claude"';
+// Spawn an interactive claude session inside the dev01 backend source. Edits
+// auto-approve (acceptEdits mode) but bash still pauses for the admin — so
+// claude can patch code freely, but git push / deploy / dangerous shell ops
+// still require explicit human approval.
+const SHELL_CMD = 'cd /tmp/tb-be && exec bash -lc "claude --permission-mode acceptEdits"';
 
 export async function terminalOpen(ws: ServerWebSocket<TerminalWsData>): Promise<void> {
   const { userId, errorContext } = ws.data;
@@ -29,7 +29,7 @@ export async function terminalOpen(ws: ServerWebSocket<TerminalWsData>): Promise
   try {
     privateKey = await readFile(DEV01_KEY);
   } catch (err: any) {
-    ws.send(`\x1b[31mError: terminal key not readable (${err.message})\x1b[0m\r\n`);
+    logger.warn({ userId, err: err.message }, '[terminal] key not readable');
     ws.close(1011, 'key missing');
     return;
   }
@@ -40,7 +40,7 @@ export async function terminalOpen(ws: ServerWebSocket<TerminalWsData>): Promise
   ssh.on('ready', () => {
     ssh.exec(SHELL_CMD, { pty: { cols: 100, rows: 30 } }, (err, stream) => {
       if (err) {
-        ws.send(`\x1b[31mError: exec failed (${err.message})\x1b[0m\r\n`);
+        logger.warn({ userId, err: err.message }, '[terminal] exec failed');
         ws.close(1011, 'exec failed');
         return;
       }
@@ -73,7 +73,6 @@ export async function terminalOpen(ws: ServerWebSocket<TerminalWsData>): Promise
 
   ssh.on('error', (err) => {
     logger.warn({ userId, err: err.message }, '[terminal] ssh error');
-    try { ws.send(`\x1b[31mSSH error: ${err.message}\x1b[0m\r\n`); } catch { /* */ }
     try { ws.close(1011, 'ssh error'); } catch { /* */ }
   });
 
