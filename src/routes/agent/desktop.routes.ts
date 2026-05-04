@@ -4,6 +4,7 @@ import { eq, and, desc, gte, sql, inArray } from 'drizzle-orm';
 import { db } from '../../db/client';
 import { calls, leads, users, campaigns, scripts, agentLeadLists, leadLists, followUpTodos } from '../../db/schema';
 import { count, asc } from 'drizzle-orm';
+import { logger } from '../../lib/logger';
 
 const router = new Hono();
 
@@ -166,10 +167,97 @@ router.post('/call/resume', async (c) => {
   return c.json({ ok: true, action: 'resume' });
 });
 
-// POST /call/transfer
+// Blind transfer the agent's currently-active call to another agent or an
+// external number. Looks up the most recent ringing/answered call for this
+// agent (must have a FreeSWITCH UUID), then issues uuid_transfer via ESL.
+//
+// target shape:
+//   agent:<userId>      → bridge to that agent's SIP user via 'user/<sipUsername>'
+//   external:<number>   → bridge out to PSTN via the configured default gateway
+//
+// IVR transfer is intentionally not supported here — the IVR menus exist in
+// the DB but no FS dialplan/Lua executes them, so a transfer there would
+// drop the call. UI surfaces this as a disabled option.
 router.post('/call/transfer', async (c) => {
-  const body = await c.req.json();
-  return c.json({ ok: true, action: 'transfer', target: body.target });
+  const body = z.object({
+    target: z.string().min(1),
+    type: z.enum(['blind', 'attended']).default('blind'),
+  }).parse(await c.req.json());
+
+  if (body.type === 'attended') {
+    return c.json({ error: 'Attended transfer not yet implemented — use blind for now.' }, 400);
+  }
+
+  const userId = c.get('user').sub;
+  const tenantId = c.get('tenantId')!;
+
+  // Find the agent's most recent active call (must have an FS UUID — without
+  // that there's nothing to transfer).
+  const [call] = await db.select({
+    id: calls.id,
+    freeswitchUuid: calls.freeswitchUuid,
+  }).from(calls)
+    .where(and(
+      eq(calls.agentId, userId),
+      eq(calls.tenantId, tenantId),
+      inArray(calls.status, ['ringing', 'answered']),
+    ))
+    .orderBy(desc(calls.startedAt))
+    .limit(1);
+  if (!call) return c.json({ error: 'No active call to transfer' }, 404);
+  if (!call.freeswitchUuid) {
+    return c.json({ error: 'Call is still connecting — wait until it is answered before transferring' }, 409);
+  }
+
+  // Resolve target → FS dial string
+  let dialString: string;
+  let targetLabel: string;
+  if (body.target.startsWith('agent:')) {
+    const agentId = body.target.slice('agent:'.length);
+    if (!/^[0-9a-f-]{36}$/i.test(agentId)) {
+      return c.json({ error: 'Invalid agent target' }, 400);
+    }
+    const [agent] = await db.select({ sipUsername: users.sipUsername })
+      .from(users)
+      .where(and(eq(users.id, agentId), eq(users.tenantId, tenantId)));
+    if (!agent?.sipUsername) {
+      return c.json({ error: 'Target agent has no SIP extension' }, 400);
+    }
+    dialString = `user/${agent.sipUsername}`;
+    targetLabel = `agent:${agent.sipUsername}`;
+  } else if (body.target.startsWith('external:')) {
+    const raw = body.target.slice('external:'.length).trim();
+    const digits = raw.replace(/[^\d+]/g, '');
+    if (!/^\+?\d{4,}$/.test(digits)) {
+      return c.json({ error: 'Invalid external number' }, 400);
+    }
+    const gateway = process.env.FS_DEFAULT_GATEWAY ?? 'OTB2';
+    dialString = `sofia/gateway/${gateway}/${digits}`;
+    targetLabel = `external:${digits}`;
+  } else {
+    return c.json({ error: 'Unsupported transfer target — use agent:<id> or external:<number>' }, 400);
+  }
+
+  // Blind transfer: hand the live channel off via inline dialplan to bridge
+  // it to the new destination. The caller stays connected; the agent's leg
+  // gets dropped because they're no longer in the bridge.
+  const { eslClient } = await import('../../esl/client');
+  if (!eslClient.isConnected()) {
+    return c.json({ error: 'FreeSWITCH ESL not connected' }, 503);
+  }
+  const fsCmd = `uuid_transfer ${call.freeswitchUuid} 'bridge:${dialString}' inline`;
+  eslClient.api(fsCmd);
+  logger.info({ callId: call.id, fsCmd, target: targetLabel }, '[transfer] issued');
+
+  await db.update(calls).set({
+    disposition: `transferred:${targetLabel}`,
+  }).where(eq(calls.id, call.id));
+
+  // Free the agent — they're no longer on this call after the transfer
+  await db.update(users).set({ status: 'available', statusChangedAt: new Date() })
+    .where(eq(users.id, userId));
+
+  return c.json({ ok: true, callId: call.id, target: targetLabel });
 });
 
 // POST /call/disposition — wrap-up
