@@ -86,6 +86,50 @@ router.delete('/errors/:id', requireRole('super_admin'), async (c) => {
   return c.json({ ok: true });
 });
 
+// Analyze a captured error with Claude — produces a root-cause hypothesis +
+// suggested fix. Super-admin only because it sends error details (which can
+// contain stack traces with internal paths) to a third-party API.
+router.post('/errors/:id/analyze', requireRole('super_admin'), async (c) => {
+  const [row] = await db.select({
+    id: errorLog.id,
+    level: errorLog.level,
+    source: errorLog.source,
+    method: errorLog.method,
+    path: errorLog.path,
+    statusCode: errorLog.statusCode,
+    errType: errorLog.errType,
+    errMessage: errorLog.errMessage,
+    stack: errorLog.stack,
+    context: errorLog.context,
+    userEmail: users.email,
+    createdAt: errorLog.createdAt,
+  }).from(errorLog)
+    .leftJoin(users, eq(errorLog.userId, users.id))
+    .where(eq(errorLog.id, c.req.param('id')));
+  if (!row) return c.json({ error: 'Error not found' }, 404);
+
+  try {
+    const { analyzeError } = await import('../integrations/claude');
+    const result = await analyzeError({
+      level: row.level,
+      source: row.source,
+      method: row.method,
+      path: row.path,
+      statusCode: row.statusCode,
+      errType: row.errType,
+      errMessage: row.errMessage,
+      stack: row.stack,
+      context: row.context as Record<string, unknown> | null,
+      userEmail: row.userEmail,
+      createdAt: row.createdAt!,
+    });
+    return c.json(result);
+  } catch (err: any) {
+    logger.warn({ err: err.message }, '[debug] claude analyze failed');
+    return c.json({ error: 'Analysis failed', detail: err.message }, 503);
+  }
+});
+
 // Frontend error reporter — open to any authenticated user. Captures
 // window.onerror / unhandledrejection from the SPA. Untrusted input, so we
 // truncate generously to avoid storing megabyte stacks.
