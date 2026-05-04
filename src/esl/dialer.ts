@@ -74,6 +74,7 @@ async function dialLoop(state: DialerState) {
       leadListIds: campaigns.leadListIds,
       retryFailedLeads: campaigns.retryFailedLeads,
       leadListStrategy: campaigns.leadListStrategy,
+      broadcastEnabled: campaigns.broadcastEnabled,
     }).from(campaigns).where(eq(campaigns.id, state.campaignId));
 
     if (!freshCampaign || (freshCampaign.status !== 'running' && freshCampaign.status !== 'active')) {
@@ -133,6 +134,8 @@ async function dialLoop(state: DialerState) {
     `);
 
     // Count available agents AFTER the heal so we don't read a stale value.
+    // Broadcast mode skips this gate — calls don't bridge to agents.
+    const broadcastMode = !!freshCampaign.broadcastEnabled;
     const [{ available }] = await db.select({
       available: sql<number>`count(*)::int`,
     }).from(users).where(and(
@@ -142,7 +145,7 @@ async function dialLoop(state: DialerState) {
       isNull(users.deletedAt),
     ));
 
-    if (available === 0) return;
+    if (!broadcastMode && available === 0) return;
 
     // Lines per tick = dial_ratio × multiple_lines (both user-set on the
     // campaign form). Decouples the fan-out target from agent count so the
@@ -240,8 +243,9 @@ async function dialLoop(state: DialerState) {
     }
 
     // Find every available agent (no per-tick limit) so a predictive ratio > 1
-    // can fan multiple lines onto the same agent.
-    const availableAgents = await db.select({ id: users.id, sipUsername: users.sipUsername, firstName: users.firstName, lastName: users.lastName })
+    // can fan multiple lines onto the same agent. Broadcast mode skips this —
+    // calls play audio and hang up, no agent bridging.
+    const availableAgents = broadcastMode ? [] : await db.select({ id: users.id, sipUsername: users.sipUsername, firstName: users.firstName, lastName: users.lastName })
       .from(users)
       .where(and(
         eq(users.tenantId, state.tenantId),
@@ -249,7 +253,7 @@ async function dialLoop(state: DialerState) {
         inArray(users.role, ['agent', 'supervisor']),
         isNull(users.deletedAt),
       ));
-    if (availableAgents.length === 0) return;
+    if (!broadcastMode && availableAgents.length === 0) return;
 
     // Resolve campaign's outbound caller ID from DID group
     const [campaign] = await db.select({
@@ -263,7 +267,10 @@ async function dialLoop(state: DialerState) {
       amdAction: campaigns.amdAction,
       amdTimeoutMs: campaigns.amdTimeoutMs,
       amdTransferTarget: campaigns.amdTransferTarget,
+      broadcastEnabled: campaigns.broadcastEnabled,
+      broadcastAudioId: campaigns.broadcastAudioId,
     }).from(campaigns).where(eq(campaigns.id, state.campaignId));
+    const isBroadcast = !!campaign?.broadcastEnabled;
 
     // Caller-ID DID pool — when the campaign has a DID group, fetch every
     // active DID in the group (ordered by created_at for stable round-robin)
@@ -396,7 +403,8 @@ async function dialLoop(state: DialerState) {
     // Cap is leadsToCall.length, which is already <= needed = linesToDial - active.
     for (let i = 0; i < leadsToCall.length; i++) {
       const lead = leadsToCall[i];
-      const agent = availableAgents[i % availableAgents.length];
+      // No agent in broadcast mode — calls go straight to playback.
+      const agent = availableAgents.length > 0 ? availableAgents[i % availableAgents.length] : null;
 
       // Resolve the caller-ID DID per lead so rotation/local-match actually
       // varies between calls in the same loop tick.
@@ -407,14 +415,14 @@ async function dialLoop(state: DialerState) {
       }
       const effectiveCallerId = pickedDid.number;
       const outboundDidId = pickedDid.id;
-      const callerName = `${agent.firstName} ${agent.lastName}`.trim();
+      const callerName = agent ? `${agent.firstName} ${agent.lastName}`.trim() : 'Broadcast';
 
       // Create CDR
       const [call] = await db.insert(calls).values({
         tenantId: state.tenantId,
         campaignId: state.campaignId,
         leadId: lead.id,
-        agentId: agent.id,
+        agentId: agent?.id ?? null,
         didId: outboundDidId,
         direction: 'outbound',
         callerId: effectiveCallerId,
@@ -436,7 +444,7 @@ async function dialLoop(state: DialerState) {
           `originate_timeout=${ringTimeout}`,
           `treepbx_call_id=${call.id}`,
           `treepbx_campaign_id=${state.campaignId}`,
-          `treepbx_agent_id=${agent.id}`,
+          ...(agent ? [`treepbx_agent_id=${agent.id}`] : []),
           `treepbx_tenant_id=${state.tenantId}`,
         ];
         // AMD wiring (mod_avmd) — start avmd at media negotiation. avmd fires
@@ -453,13 +461,26 @@ async function dialLoop(state: DialerState) {
         }
         const vars = varList.join(',');
 
-        // Originate call to lead, then bridge to agent extension
         // Build failover dial string: try each gateway in order
-        const agentExtFs = agent.sipUsername || agent.id;
         const dialString = gateways
           .map(gw => `sofia/gateway/${gw}/${lead.phone}`)
           .join('|');
-        const cmd = `originate {${vars}}${dialString} &bridge(user/${agentExtFs})`;
+
+        // Broadcast mode: play audio on answer, then hang up. No agent bridge.
+        // V1 plays FS's built-in hold music — real audio file integration
+        // (broadcastAudioId → MinIO bytes → FS playback) is a follow-up; FS
+        // would need a public unauth endpoint or local file deploy to
+        // dereference our audio_files rows.
+        let bridgeApp: string;
+        if (isBroadcast) {
+          bridgeApp = `&playback($\${hold_music})`;
+        } else {
+          // Non-broadcast — agent is guaranteed to be set (loop only runs
+          // when availableAgents.length > 0 in non-broadcast mode).
+          const agentExtFs = agent!.sipUsername || agent!.id;
+          bridgeApp = `&bridge(user/${agentExtFs})`;
+        }
+        const cmd = `originate {${vars}}${dialString} ${bridgeApp}`;
         // Async bgapi: when FS replies (with the BACKGROUND_JOB event), settle
         // the CDR. On +OK, link the FS UUID. On -ERR, mark the CDR failed
         // immediately (no more 30s orphan window) and free the agent + lead.
@@ -496,26 +517,28 @@ async function dialLoop(state: DialerState) {
         continue;
       }
 
-      // Notify agent via WebSocket — deliver the call to their desktop
-      const agentExt = agent.sipUsername;
-      if (agentExt) {
-        sendToAgent(agentExt, 'campaign:call', {
-          callId: call.id,
-          campaignId: state.campaignId,
-          leadId: lead.id,
-          leadName: `${lead.firstName ?? ''} ${lead.lastName ?? ''}`.trim(),
-          leadPhone: lead.phone,
-          leadCompany: lead.company,
-        });
-        // Also notify via user ID room
-        sendToAgent(agent.id, 'campaign:call', {
-          callId: call.id,
-          campaignId: state.campaignId,
-          leadId: lead.id,
-          leadName: `${lead.firstName ?? ''} ${lead.lastName ?? ''}`.trim(),
-          leadPhone: lead.phone,
-          leadCompany: lead.company,
-        });
+      // Notify agent via WebSocket — deliver the call to their desktop.
+      // Skipped in broadcast mode (no agent attached to the call).
+      if (agent) {
+        const agentExt = agent.sipUsername;
+        if (agentExt) {
+          sendToAgent(agentExt, 'campaign:call', {
+            callId: call.id,
+            campaignId: state.campaignId,
+            leadId: lead.id,
+            leadName: `${lead.firstName ?? ''} ${lead.lastName ?? ''}`.trim(),
+            leadPhone: lead.phone,
+            leadCompany: lead.company,
+          });
+          sendToAgent(agent.id, 'campaign:call', {
+            callId: call.id,
+            campaignId: state.campaignId,
+            leadId: lead.id,
+            leadName: `${lead.firstName ?? ''} ${lead.lastName ?? ''}`.trim(),
+            leadPhone: lead.phone,
+            leadCompany: lead.company,
+          });
+        }
       }
 
       // Update lead status
@@ -523,10 +546,10 @@ async function dialLoop(state: DialerState) {
         status: 'dialing',
         attempts: (lead.attempts ?? 0) + 1,
         lastAttemptAt: new Date(),
-        assignedAgentId: agent.id,
+        assignedAgentId: agent?.id ?? null,
       }).where(eq(leads.id, lead.id));
 
-      logger.info({ campaignId: state.campaignId, leadId: lead.id, phone: lead.phone, agentId: agent.id, callId: call.id }, 'Campaign: dialing lead');
+      logger.info({ campaignId: state.campaignId, leadId: lead.id, phone: lead.phone, agentId: agent?.id ?? null, callId: call.id, broadcast: isBroadcast }, 'Campaign: dialing lead');
     }
 
     // Flip every agent we just dispatched calls to → on_call, in a single

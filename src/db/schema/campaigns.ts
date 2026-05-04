@@ -19,6 +19,10 @@ export const campaigns = pgTable('campaigns', {
   // Dialer
   dialRatio: numeric('dial_ratio', { precision: 6, scale: 2 }).default('1.0'),
   multipleLines: integer('multiple_lines').default(1),
+  // Voice-broadcast mode: when true, dialer plays an audio recording on
+  // answer instead of bridging to an agent. No agent required to dial.
+  broadcastEnabled: boolean('broadcast_enabled').default(false),
+  broadcastAudioId: uuid('broadcast_audio_id'),
   maxAbandonRate: numeric('max_abandon_rate', { precision: 5, scale: 2 }).default('3.0'),
   wrapUpSeconds: integer('wrap_up_seconds').default(30),
   ringTimeoutSeconds: integer('ring_timeout_seconds').default(25),

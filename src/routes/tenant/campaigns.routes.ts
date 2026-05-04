@@ -32,6 +32,8 @@ const campaignSchema = z.object({
     .transform((n) => n.toFixed(2))
     .default('1.0'),
   multipleLines: z.coerce.number().int().min(1).max(1000).default(1),
+  broadcastEnabled: z.boolean().nullable().default(false),
+  broadcastAudioId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
   maxAbandonRate: z.union([z.number(), z.string()])
     .transform((v) => Number(v))
     .pipe(z.number().min(0).max(100))
