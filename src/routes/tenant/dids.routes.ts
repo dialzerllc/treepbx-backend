@@ -381,10 +381,34 @@ router.post('/groups/:gid/accept', requireRole('tenant_admin'), async (c) => {
     .where(and(eq(platformDidGroups.id, groupId), eq(platformDidGroups.assignedTenantId, tenantId)));
   if (!group) throw new NotFound('Group not found or not assigned to you');
   // Mark all DIDs in this group as assigned to this tenant
-  await db.update(platformDids)
+  const accepted = await db.update(platformDids)
     .set({ status: 'assigned', tenantId })
-    .where(eq(platformDids.groupId, groupId));
-  return c.json({ ok: true });
+    .where(eq(platformDids.groupId, groupId))
+    .returning();
+
+  // Materialize tenant `dids` rows so the dialer (and bulk/move, etc.) can see
+  // them. Skip rows we've already linked. This keeps the tenant-side dids
+  // table as the single source of truth for the dialer.
+  if (accepted.length > 0) {
+    const ids = accepted.map((p) => p.id);
+    const existing = await db.select({ platformDidId: dids.platformDidId }).from(dids)
+      .where(and(eq(dids.tenantId, tenantId), inArray(dids.platformDidId, ids)));
+    const linked = new Set(existing.map((e) => e.platformDidId));
+    const toInsert = accepted.filter((p) => !linked.has(p.id)).map((p) => ({
+      tenantId,
+      platformDidId: p.id,
+      number: p.number,
+      country: p.country ?? 'US',
+      city: p.city,
+      state: p.state,
+      didType: (p.didType as 'local' | 'tollfree' | 'international') ?? 'local',
+      active: true,
+      routeType: 'ivr',
+      description: `Platform DID (${p.provider ?? 'unspecified'})`,
+    }));
+    if (toInsert.length > 0) await db.insert(dids).values(toInsert);
+  }
+  return c.json({ ok: true, materialized: accepted.length });
 });
 
 // Decline platform-assigned DID group
@@ -396,9 +420,18 @@ router.post('/groups/:gid/decline', requireRole('tenant_admin'), async (c) => {
     .set({ assignedTenantId: null })
     .where(and(eq(platformDidGroups.id, groupId), eq(platformDidGroups.assignedTenantId, tenantId)));
   // Release any DIDs that were assigned
-  await db.update(platformDids)
+  const released = await db.update(platformDids)
     .set({ status: 'available', tenantId: null })
-    .where(and(eq(platformDids.groupId, groupId), eq(platformDids.tenantId, tenantId)));
+    .where(and(eq(platformDids.groupId, groupId), eq(platformDids.tenantId, tenantId)))
+    .returning({ id: platformDids.id });
+
+  // Drop matching tenant `dids` rows so the dialer stops using them
+  if (released.length > 0) {
+    const ids = released.map((r) => r.id);
+    await db.delete(agentDids).where(inArray(agentDids.didId,
+      (await db.select({ id: dids.id }).from(dids).where(inArray(dids.platformDidId, ids))).map((d) => d.id)));
+    await db.delete(dids).where(and(eq(dids.tenantId, tenantId), inArray(dids.platformDidId, ids)));
+  }
   return c.json({ ok: true });
 });
 
@@ -406,10 +439,21 @@ router.post('/groups/:gid/decline', requireRole('tenant_admin'), async (c) => {
 router.post('/groups/:gid/release', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const groupId = c.req.param('gid');
-  // Clear DIDs
-  await db.update(platformDids)
+  // Clear DIDs (release back to the platform pool)
+  const released = await db.update(platformDids)
     .set({ status: 'available', tenantId: null })
-    .where(and(eq(platformDids.groupId, groupId), eq(platformDids.tenantId, tenantId)));
+    .where(and(eq(platformDids.groupId, groupId), eq(platformDids.tenantId, tenantId)))
+    .returning({ id: platformDids.id });
+  // Drop matching tenant `dids` rows so they stop appearing on the tenant page
+  if (released.length > 0) {
+    const ids = released.map((r) => r.id);
+    const linkedDidIds = (await db.select({ id: dids.id }).from(dids)
+      .where(and(eq(dids.tenantId, tenantId), inArray(dids.platformDidId, ids)))).map((d) => d.id);
+    if (linkedDidIds.length > 0) {
+      await db.delete(agentDids).where(inArray(agentDids.didId, linkedDidIds));
+      await db.delete(dids).where(inArray(dids.id, linkedDidIds));
+    }
+  }
   // Clear group assignment
   await db.update(platformDidGroups)
     .set({ assignedTenantId: null })
