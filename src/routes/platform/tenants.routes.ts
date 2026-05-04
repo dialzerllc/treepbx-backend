@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { optionalUuid, optionalEmail } from '../../lib/zod-helpers';
+import { optionalUuid, optionalEmail, email } from '../../lib/zod-helpers';
 import { eq, and, like, desc, count, isNull, sql, inArray } from 'drizzle-orm';
 import { db } from '../../db/client';
 import { tenants, users, wallets, transactions, plans } from '../../db/schema';
@@ -18,7 +18,7 @@ const createTenantSchema = z.object({
   billingEmail: optionalEmail(),
   timezone: z.string().default('UTC'),
   country: z.string().default('US'),
-  adminEmail: z.string().email(),
+  adminEmail: email(),
   adminFirstName: z.string().min(1),
   adminLastName: z.string().min(1),
   adminPassword: z.string().min(8),

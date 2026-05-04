@@ -46,7 +46,7 @@ export const errorHandler: ErrorHandler = (err, c) => {
 // original error response.
 async function recordError(c: any, err: any, level: 'error' | 'warn', status: number, extra?: Record<string, unknown>): Promise<void> {
   try {
-    const userId = c.get('userId') ?? null;
+    const userId = c.get('user')?.sub ?? null;
     const tenantId = c.get('tenantId') ?? null;
     await db.insert(errorLog).values({
       level,

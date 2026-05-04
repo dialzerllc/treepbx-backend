@@ -174,7 +174,8 @@ router.get('/:id/play', async (c) => {
 
   c.header('Content-Type', mime);
   c.header('Content-Length', String(buffer.length));
-  return c.body(buffer);
+  // Hono types don't accept Buffer directly; widen to Uint8Array which is BodyInit-compatible.
+  return c.body(new Uint8Array(buffer));
 });
 
 router.post('/', requireRole('tenant_admin', 'supervisor'), async (c) => {

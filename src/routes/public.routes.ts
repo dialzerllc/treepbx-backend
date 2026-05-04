@@ -5,12 +5,13 @@ import { db } from '../db/client';
 import { contactSubmissions } from '../db/schema';
 import { BadRequest } from '../lib/errors';
 import { logger } from '../lib/logger';
+import { email } from '../lib/zod-helpers';
 
 const router = new Hono();
 
 const contactSchema = z.object({
   name: z.string().min(1).max(200),
-  email: z.string().email().max(200),
+  email: email().pipe(z.string().max(200)),
   company: z.string().max(200).nullable().optional(),
   agents: z.string().max(50).nullable().optional(),
   message: z.string().max(5000).nullable().optional(),

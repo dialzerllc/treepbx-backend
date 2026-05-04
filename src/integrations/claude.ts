@@ -96,10 +96,12 @@ function buildUserPrompt(err: ErrorRow): string {
 
 export async function analyzeError(err: ErrorRow): Promise<{ analysis: string; usage: { input: number; output: number; cacheRead: number } }> {
   const claude = getClaude();
+  // SDK 0.40 type defs predate adaptive thinking; the wire-level field is
+  // accepted by the API. Cast to bypass the stale type check.
   const stream = claude.messages.stream({
     model: 'claude-opus-4-7',
     max_tokens: 4096,
-    thinking: { type: 'adaptive' },
+    thinking: { type: 'adaptive' as any },
     system: [
       { type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } },
     ],

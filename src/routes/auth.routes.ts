@@ -2,11 +2,12 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import * as authService from '../services/auth.service';
 import { authMiddleware } from '../middleware/auth';
+import { loginEmail } from '../lib/zod-helpers';
 
 const auth = new Hono();
 
 const loginSchema = z.object({
-  email: z.string().email(),
+  email: loginEmail(),
   password: z.string().min(1),
   totpCode: z.string().regex(/^\d{6}$/).optional(),
 });

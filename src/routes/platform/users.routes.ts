@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { optionalEmail } from '../../lib/zod-helpers';
+import { optionalEmail, email } from '../../lib/zod-helpers';
 import { eq, and, like, desc, count, isNull, or } from 'drizzle-orm';
 import { db } from '../../db/client';
 import { users } from '../../db/schema';
@@ -11,7 +11,7 @@ import { hashPassword } from '../../lib/password';
 const router = new Hono();
 
 const createUserSchema = z.object({
-  email: z.string().email(),
+  email: email(),
   password: z.string().min(1).optional(),
   firstName: z.string().min(1),
   lastName: z.string().min(1),

@@ -198,7 +198,7 @@ router.post('/client-error', async (c) => {
     url: z.string().optional(),
     extra: z.record(z.unknown()).optional(),
   }).parse(await c.req.json());
-  const userId = c.get('userId') ?? null;
+  const userId = c.get('user')?.sub ?? null;
   const tenantId = c.get('tenantId') ?? null;
   await db.insert(errorLog).values({
     level: 'error',

@@ -53,6 +53,14 @@ fi
   echo "[fs-bootstrap] WARN: no sip_proxy IPs resolved, ACL will be empty (default-deny)"
 }
 
+# Snapshot config hashes before any in-container edits. We use these later to
+# skip `sofia profile {external,internal} restart` when nothing actually
+# changed. A profile restart drops every active SIP-WS connection (softphones
+# observe a 1006 close), so re-runs of this script — /rebootstrap fan-out,
+# bootstrap retries on transient SSH/docker races, idempotent re-applies —
+# would otherwise disconnect every agent for no gain.
+HASH_BEFORE=$(ssh $SSH_OPTS root@"$FS_IP" "docker exec fs sh -c 'sha256sum /etc/freeswitch/sip_profiles/external.xml /etc/freeswitch/sip_profiles/internal.xml /etc/freeswitch/vars.xml 2>/dev/null'" || echo "")
+
 # 1+2. external profile config — auth-calls off + ACL bound
 ssh $SSH_OPTS root@"$FS_IP" "docker exec fs sh -c '
   CFG=/etc/freeswitch/sip_profiles/external.xml
@@ -201,11 +209,36 @@ ssh $SSH_OPTS root@"$FS_IP" "
   ufw allow 16384:32768/udp >/dev/null 2>&1 || true
 "
 
-# 5. Reload — reloadacl applies the new ACL; restart external profile picks up auth-calls=false;
-#    restart internal profile picks up the context=default flip.
+# 5. Reload — reloadacl + reloadxml are cheap and don't disconnect anything,
+#    so always run them. Profile restarts are gated by hash diff so a no-op
+#    re-bootstrap doesn't sever live softphone WS connections.
 ssh $SSH_OPTS root@"$FS_IP" "docker exec fs fs_cli -p $ESL_PW -x 'reloadacl' >/dev/null"
 ssh $SSH_OPTS root@"$FS_IP" "docker exec fs fs_cli -p $ESL_PW -x 'reloadxml'  >/dev/null"
-ssh $SSH_OPTS root@"$FS_IP" "docker exec fs fs_cli -p $ESL_PW -x 'sofia profile external restart' >/dev/null"
-ssh $SSH_OPTS root@"$FS_IP" "docker exec fs fs_cli -p $ESL_PW -x 'sofia profile internal restart' >/dev/null"
+
+HASH_AFTER=$(ssh $SSH_OPTS root@"$FS_IP" "docker exec fs sh -c 'sha256sum /etc/freeswitch/sip_profiles/external.xml /etc/freeswitch/sip_profiles/internal.xml /etc/freeswitch/vars.xml 2>/dev/null'" || echo "")
+
+ext_before=$(printf '%s\n' "$HASH_BEFORE" | awk '/external\.xml$/{print $1}')
+ext_after=$(printf  '%s\n' "$HASH_AFTER"  | awk '/external\.xml$/{print $1}')
+int_before=$(printf '%s\n' "$HASH_BEFORE" | awk '/internal\.xml$/{print $1}')
+int_after=$(printf  '%s\n' "$HASH_AFTER"  | awk '/internal\.xml$/{print $1}')
+vars_before=$(printf '%s\n' "$HASH_BEFORE" | awk '/vars\.xml$/{print $1}')
+vars_after=$(printf  '%s\n' "$HASH_AFTER"  | awk '/vars\.xml$/{print $1}')
+
+if [ "$ext_before" != "$ext_after" ]; then
+  ssh $SSH_OPTS root@"$FS_IP" "docker exec fs fs_cli -p $ESL_PW -x 'sofia profile external restart' >/dev/null"
+  echo "[fs-bootstrap] external profile restarted (config changed)"
+else
+  echo "[fs-bootstrap] external profile unchanged — skipping restart"
+fi
+
+# vars.xml is shared, but the softphone-relevant settings inside it (realm,
+# default_password, default_outbound_gateway) flow through the internal
+# profile, so a vars.xml change still requires an internal restart.
+if [ "$int_before" != "$int_after" ] || [ "$vars_before" != "$vars_after" ]; then
+  ssh $SSH_OPTS root@"$FS_IP" "docker exec fs fs_cli -p $ESL_PW -x 'sofia profile internal restart' >/dev/null"
+  echo "[fs-bootstrap] internal profile restarted (config changed) — softphones will reconnect"
+else
+  echo "[fs-bootstrap] internal profile unchanged — skipping restart, softphones stay connected"
+fi
 
 echo "[fs-bootstrap] $FS_IP — external profile + ACL + dialplan applied"

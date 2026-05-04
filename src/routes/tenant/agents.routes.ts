@@ -6,14 +6,14 @@ import { users, skills, agentSkills, agentDids, dids, agentLeadLists, leadLists 
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
 import { NotFound, BadRequest } from '../../lib/errors';
 import { requireRole } from '../../middleware/roles';
-import { optionalUuid } from '../../lib/zod-helpers';
+import { optionalUuid, email } from '../../lib/zod-helpers';
 
 const router = new Hono();
 
 const sipUsernameSchema = z.string().max(4, 'Extension must be at most 4 digits').regex(/^\d{1,4}$/, 'Extension must be 1-4 digits').nullable().optional();
 
 const agentSchema = z.object({
-  email: z.string().email(),
+  email: email(),
   firstName: z.string().min(1),
   lastName: z.string().min(1),
   role: z.enum(['agent', 'supervisor', 'tenant_admin']),
@@ -42,7 +42,7 @@ router.post('/import', requireRole('tenant_admin'), async (c) => {
     agents: z.array(z.object({
       firstName: z.string().min(1),
       lastName: z.string().min(1),
-      email: z.string().email(),
+      email: email(),
       role: z.enum(['agent', 'supervisor', 'tenant_admin']).default('agent'),
       teamId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
       sipUsername: sipUsernameSchema,
