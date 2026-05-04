@@ -212,6 +212,10 @@ async function dialLoop(state: DialerState) {
       byocRouting: campaigns.byocRouting,
       ringTimeoutSeconds: campaigns.ringTimeoutSeconds,
       rateCardId: campaigns.rateCardId,
+      amdEnabled: campaigns.amdEnabled,
+      amdAction: campaigns.amdAction,
+      amdTimeoutMs: campaigns.amdTimeoutMs,
+      amdTransferTarget: campaigns.amdTransferTarget,
     }).from(campaigns).where(eq(campaigns.id, state.campaignId));
 
     // Pick a DID for caller ID if a DID group is configured
@@ -337,7 +341,7 @@ async function dialLoop(state: DialerState) {
       // Originate the call via FreeSWITCH ESL
       if (eslClient.isConnected()) {
         const safeName = callerName.replace(/[^a-zA-Z0-9 _-]/g, '');
-        const vars = [
+        const varList = [
           `origination_caller_id_number=${effectiveCallerId}`,
           `origination_caller_id_name='${safeName}'`,
           `originate_timeout=${ringTimeout}`,
@@ -345,7 +349,20 @@ async function dialLoop(state: DialerState) {
           `treepbx_campaign_id=${state.campaignId}`,
           `treepbx_agent_id=${agent.id}`,
           `treepbx_tenant_id=${state.tenantId}`,
-        ].join(',');
+        ];
+        // AMD wiring (mod_avmd) — start avmd at media negotiation. avmd fires
+        // an avmd::beep event when it detects voicemail; we then set
+        // amd_result=machine on the channel via execute_on_avmd_beep so it
+        // surfaces on hangup_complete via variable_amd_result.
+        if (campaign?.amdEnabled) {
+          varList.push(`execute_on_media='avmd start'`);
+          varList.push(`execute_on_avmd_beep='set amd_result=machine'`);
+          varList.push(`avmd-inbound-channel=true`);
+          if (campaign.amdAction === 'hangup') {
+            varList.push(`execute_on_avmd_beep_2='hangup MACHINE_DETECTED'`);
+          }
+        }
+        const vars = varList.join(',');
 
         // Originate call to lead, then bridge to agent extension
         // Build failover dial string: try each gateway in order

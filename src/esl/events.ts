@@ -281,7 +281,14 @@ export function startESLEventListener() {
             const qualityPct = headers['variable_rtp_audio_in_quality_percentage'] ? parseFloat(headers['variable_rtp_audio_in_quality_percentage']) : null;
             const packetLossPct = qualityPct !== null ? Math.round((100 - qualityPct) * 100) / 100 : null;
 
-            logger.info({ uuid, duration, billSec, codec, carrier, mos }, '[ESL] HANGUP_COMPLETE details');
+            // AMD result — set by execute_on_avmd_beep when mod_avmd detects
+            // voicemail. If the channel ran AMD but never tripped, infer
+            // 'human' from a non-trivial billsec on a connected call.
+            const ranAmd = headers['variable_avmd-inbound-channel'] === 'true';
+            const amdResult = headers['variable_amd_result']
+              ?? (ranAmd && hangupCause === 'NORMAL_CLEARING' && billSec > 5 ? 'human' : null);
+
+            logger.info({ uuid, duration, billSec, codec, carrier, mos, amdResult }, '[ESL] HANGUP_COMPLETE details');
 
             await db.update(calls).set({
               durationSeconds: duration,
@@ -295,6 +302,7 @@ export function startESLEventListener() {
               ...(mos && { mos: String(mos) }),
               ...(jitterMs && { jitterMs: String(jitterMs) }),
               ...(packetLossPct && { packetLossPct: String(packetLossPct) }),
+              ...(amdResult && { amdResult }),
             }).where(eq(calls.freeswitchUuid, uuid));
 
             // Dispatch billing if call had duration

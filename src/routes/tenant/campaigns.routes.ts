@@ -66,7 +66,11 @@ async function validateCampaignLeadLists(tenantId: string, listIds: string[]): P
   if (listIds.length === 0) return;
   const picked = await db.select({ id: leadLists.id, name: leadLists.name, assignmentType: leadLists.assignmentType }).from(leadLists)
     .where(and(inArray(leadLists.id, listIds), eq(leadLists.tenantId, tenantId)));
-  if (picked.length !== listIds.length) throw new BadRequest('One or more lead lists not found');
+  if (picked.length !== listIds.length) {
+    const foundIds = new Set(picked.map((l) => l.id));
+    const missing = listIds.filter((id) => !foundIds.has(id));
+    throw new BadRequest(`Lead list(s) not found or not in this tenant: ${missing.join(', ')}`);
+  }
   const blocked = picked.filter((l) => l.assignmentType === 'agents');
   if (blocked.length > 0) {
     throw new BadRequest(`Lead list(s) in agent-only mode can't be used by campaigns: ${blocked.map((l) => l.name).join(', ')}`);

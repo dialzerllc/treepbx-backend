@@ -54,6 +54,9 @@ export class ESLClient extends EventEmitter {
           logger.info('ESL authenticated');
           // Subscribe to all events
           this.send('event plain ALL');
+          // Ensure mod_avmd is loaded — required for AMD on campaigns. No-op
+          // if already loaded; if FS was restarted, this brings it back.
+          this.send('bgapi load mod_avmd');
           resolve();
         } else {
           reject(new Error('ESL auth failed'));
