@@ -90,11 +90,12 @@ async function dialLoop(state: DialerState) {
     state.leadListIds = freshListIds.length > 0 ? freshListIds : (freshCampaign.leadListId ? [freshCampaign.leadListId] : []);
     state.leadListStrategy = freshCampaign.leadListStrategy ?? 'sequential';
 
-    // Sweeper: any CDR for this campaign that's been stuck in 'ringing' with
-    // no FreeSWITCH UUID for >30s is an orphan — the originate either failed
-    // before FS produced a CHANNEL_CREATE event, or events.ts never linked it.
-    // Mark these failed so they stop counting against `active` (and the
-    // dialer can keep dialing toward the linesToDial target).
+    // Sweeper: clean two classes of orphan CDRs that would otherwise gate
+    // the dialer by inflating `active`:
+    //  1. status='ringing' with no FS UUID, > 30s old — originate failed
+    //     before FS produced a CHANNEL_CREATE event.
+    //  2. status='answered' or 'ringing' > 5 min old — events.ts missed the
+    //     hangup_complete and the CDR is permanently stuck.
     await db.update(calls).set({
       status: 'failed',
       hangupCause: 'ORIGINATE_TIMEOUT',
@@ -104,6 +105,15 @@ async function dialLoop(state: DialerState) {
       eq(calls.status, 'ringing'),
       isNull(calls.freeswitchUuid),
       lte(calls.startedAt, sql`NOW() - INTERVAL '30 seconds'`),
+    ));
+    await db.update(calls).set({
+      status: 'completed',
+      hangupCause: sql`COALESCE(${calls.hangupCause}, 'STUCK_ORPHAN')`,
+      endedAt: sql`COALESCE(${calls.endedAt}, NOW())`,
+    }).where(and(
+      eq(calls.campaignId, state.campaignId),
+      inArray(calls.status, ['ringing', 'answered']),
+      lte(calls.startedAt, sql`NOW() - INTERVAL '5 minutes'`),
     ));
 
     // Heal stuck 'on_call' agents — if they have NO active CDRs, flip them
