@@ -199,7 +199,8 @@ async function dialLoop(state: DialerState) {
       return;
     }
 
-    // Find available agents
+    // Find every available agent (no per-tick limit) so a predictive ratio > 1
+    // can fan multiple lines onto the same agent.
     const availableAgents = await db.select({ id: users.id, sipUsername: users.sipUsername, firstName: users.firstName, lastName: users.lastName })
       .from(users)
       .where(and(
@@ -207,8 +208,8 @@ async function dialLoop(state: DialerState) {
         eq(users.status, 'available'),
         inArray(users.role, ['agent', 'supervisor']),
         isNull(users.deletedAt),
-      ))
-      .limit(needed);
+      ));
+    if (availableAgents.length === 0) return;
 
     // Resolve campaign's outbound caller ID from DID group
     const [campaign] = await db.select({
@@ -349,9 +350,13 @@ async function dialLoop(state: DialerState) {
       if (tenantDid) tenantFallback = tenantDid;
     }
 
-    for (let i = 0; i < leadsToCall.length && i < availableAgents.length; i++) {
+    // Predictive fan-out: fire every needed line, rotating agents round-robin.
+    // With dial_ratio > 1, multiple bridges queue onto the same agent; the
+    // first lead to answer wins, the rest fail with USER_BUSY (abandoned).
+    // Cap is leadsToCall.length, which is already <= needed = linesToDial - active.
+    for (let i = 0; i < leadsToCall.length; i++) {
       const lead = leadsToCall[i];
-      const agent = availableAgents[i];
+      const agent = availableAgents[i % availableAgents.length];
 
       // Resolve the caller-ID DID per lead so rotation/local-match actually
       // varies between calls in the same loop tick.
