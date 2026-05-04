@@ -22,8 +22,20 @@ const campaignSchema = z.object({
   voicebotConfigId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
   rateCardId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
   scriptId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
-  dialRatio: z.union([z.number(), z.string()]).transform(String).default('1.0'),
-  maxAbandonRate: z.union([z.number(), z.string()]).transform(String).default('3.0'),
+  // dial_ratio is numeric(4,2) → max 99.99, but a sane predictive ratio is well
+  // under 10. maxAbandonRate is a percentage, so 0–100. Validate before
+  // touching Postgres so we 400 with a useful message instead of a 500
+  // "numeric field overflow".
+  dialRatio: z.union([z.number(), z.string()])
+    .transform((v) => Number(v))
+    .pipe(z.number().min(0.1).max(10))
+    .transform((n) => n.toFixed(2))
+    .default('1.0'),
+  maxAbandonRate: z.union([z.number(), z.string()])
+    .transform((v) => Number(v))
+    .pipe(z.number().min(0).max(100))
+    .transform((n) => n.toFixed(2))
+    .default('3.0'),
   wrapUpSeconds: z.coerce.number().int().default(30),
   ringTimeoutSeconds: z.coerce.number().int().default(25),
   amdEnabled: z.boolean().nullable().default(false),
