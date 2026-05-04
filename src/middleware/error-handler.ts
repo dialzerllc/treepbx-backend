@@ -24,9 +24,16 @@ export const errorHandler: ErrorHandler = (err, c) => {
 
   if (err instanceof AppError) {
     // 5xx are real server problems → 'error'. 4xx are expected control flow
-    // (Unauthorized, NotFound, BadRequest) → 'warn' so the debugger still
-    // shows them when investigating a UI failure, filterable by level.
-    void recordError(c, err, err.statusCode >= 500 ? 'error' : 'warn', err.statusCode);
+    // (NotFound, BadRequest) → 'warn' so the debugger still shows them when
+    // investigating a UI failure, filterable by level.
+    //
+    // Skip routine 401s entirely: expired tokens, logged-out tabs, and pre-auth
+    // requests all surface as 401 and would otherwise drown out real bugs in
+    // the debugger. Real auth misconfiguration shows up as 5xx instead.
+    const skipLog = err.statusCode === 401;
+    if (!skipLog) {
+      void recordError(c, err, err.statusCode >= 500 ? 'error' : 'warn', err.statusCode);
+    }
     return c.json({ error: err.message, code: err.code }, err.statusCode as any);
   }
 
