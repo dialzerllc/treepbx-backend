@@ -175,12 +175,27 @@ router.put('/bulk-move', async (c) => {
   return c.json({ ok: true, updated: body.didIds.length });
 });
 
-// Bulk delete platform DIDs
+// Bulk delete platform DIDs. Detaches FK references from the tenant `dids`
+// table first so the delete doesn't 500 with a foreign-key violation when
+// any of the picked DIDs were ever assigned to a tenant.
 router.post('/bulk-delete', async (c) => {
   const body = z.object({
     didIds: z.array(z.string().uuid()),
   }).parse(await c.req.json());
 
+  if (body.didIds.length === 0) {
+    return c.json({ ok: true, deleted: 0 });
+  }
+
+  // Lazy import to avoid loading the tenant dids module at platform-route eval time.
+  const { dids } = await import('../../db/schema');
+
+  // 1. Null-out the platformDidId reference on any tenant DIDs that point at
+  //    these platform DIDs. Without this the FK on dids.platform_did_id
+  //    rejects the delete.
+  await db.update(dids).set({ platformDidId: null }).where(inArray(dids.platformDidId, body.didIds));
+
+  // 2. Delete the platform DIDs themselves.
   const deleted = await db.delete(platformDids)
     .where(inArray(platformDids.id, body.didIds))
     .returning({ id: platformDids.id });
