@@ -28,7 +28,7 @@ const campaignSchema = z.object({
   // "numeric field overflow".
   dialRatio: z.union([z.number(), z.string()])
     .transform((v) => Number(v))
-    .pipe(z.number().min(0.1).max(10))
+    .pipe(z.number().min(0.1).max(99))
     .transform((n) => n.toFixed(2))
     .default('1.0'),
   maxAbandonRate: z.union([z.number(), z.string()])
