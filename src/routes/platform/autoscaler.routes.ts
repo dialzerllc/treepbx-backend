@@ -91,7 +91,19 @@ router.get('/fleet', async (c) => {
 router.get('/observation', async (c) => {
   try {
     const obs = await observer();
-    return c.json(obs);
+    // Backward-compatible shape: flat top-level mirrors the freeswitch service
+    // (what the existing FE expects), plus a `services` map for per-service
+    // detail. Lets the page keep working without a redeploy.
+    const fs = obs.freeswitch;
+    return c.json({
+      activeCc: fs.load,
+      forecastCc: 0,
+      carrierCeiling: fs.carrierCeiling,
+      targetCc: fs.targetCc,
+      perNodeCapacity: fs.perNodeCapacity,
+      nodes: fs.nodes,
+      services: obs,
+    });
   } catch (err: any) {
     logger.error({ err }, '[autoscaler.routes] observation failed');
     return c.json({ error: err?.message ?? 'observer failed' }, 500);
