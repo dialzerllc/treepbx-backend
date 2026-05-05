@@ -40,6 +40,7 @@ async function loadActiveRules(): Promise<PlannerRule[]> {
     maxInstances: r.maxInstances,
     callsPerInstance: r.callsPerInstance,
     cooldownSeconds: r.cooldownSeconds,
+    warmSpare: r.warmSpare,
   }));
 }
 

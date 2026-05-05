@@ -141,6 +141,7 @@ router.post('/:id/test', async (c) => {
     maxInstances: rule.maxInstances,
     callsPerInstance: rule.callsPerInstance,
     cooldownSeconds: rule.cooldownSeconds,
+    warmSpare: rule.warmSpare,
   };
   const serviceObs = (obs as any)[rule.serviceType] ?? obs.freeswitch;
   const plan = planner(serviceObs, [plannerRule]);

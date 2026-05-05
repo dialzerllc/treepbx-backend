@@ -22,6 +22,7 @@ export interface PlannerRule {
   maxInstances: number | null;
   callsPerInstance: number | null;
   cooldownSeconds: number | null;
+  warmSpare: number | null;
 }
 
 export interface MatchedRule {
@@ -54,10 +55,14 @@ export function planner(obs: ServiceObservation, rules: PlannerRule[] = []): Pla
     : obs.perNodeCapacity;
   const cooldown = matched?.cooldownSeconds ?? DEFAULT_COOLDOWN;
 
-  // Desired active capacity to handle targetCc, then +1 warm spare so a sudden
-  // burst has ~60s of buffer while a new node provisions. Bounded by the rule.
+  // Desired active capacity to handle targetCc, plus an optional warm spare
+  // so a sudden burst has buffer while a new node provisions. warm_spare=0
+  // keeps the floor at minInstances until load crosses the threshold —
+  // useful for services that bring up instantly (e.g. sip_proxy at zero
+  // traffic). Bounded by the rule's max.
+  const warmSpare = matched?.warmSpare ?? 1;
   const neededForLoad = Math.max(min, Math.ceil(obs.targetCc / perNode));
-  const desiredNodes = Math.min(max, neededForLoad + 1);
+  const desiredNodes = Math.min(max, neededForLoad + warmSpare);
 
   // Existing capacity — subtract stale nodes because they can't actually serve.
   const healthy = Math.max(0, obs.nodes.active - obs.nodes.stale);
