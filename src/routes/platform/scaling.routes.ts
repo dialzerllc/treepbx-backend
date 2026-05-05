@@ -142,7 +142,8 @@ router.post('/:id/test', async (c) => {
     callsPerInstance: rule.callsPerInstance,
     cooldownSeconds: rule.cooldownSeconds,
   };
-  const plan = planner(obs, [plannerRule]);
+  const serviceObs = (obs as any)[rule.serviceType] ?? obs.freeswitch;
+  const plan = planner(serviceObs, [plannerRule]);
   const cooldownBlocked = await ruleCooldownActive(rule.id, rule.cooldownSeconds ?? 300);
 
   const wouldDo = cooldownBlocked
