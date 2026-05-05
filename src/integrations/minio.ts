@@ -2,15 +2,23 @@ import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } fro
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { env } from '../env';
 
-// MinIO is S3-compatible, use AWS SDK
+// S3-compatible client. Works with MinIO (path-style HTTP) or Cloudflare R2 /
+// AWS S3 (HTTPS, virtual-hosted style). MINIO_ENDPOINT may be a bare host
+// (legacy: combined with MINIO_PORT into http://host:port) or a full URL
+// (https://<acct>.r2.cloudflarestorage.com) — for R2 also set MINIO_REGION=auto
+// and MINIO_FORCE_PATH_STYLE=false.
+const endpointUrl = /^https?:\/\//i.test(env.MINIO_ENDPOINT)
+  ? env.MINIO_ENDPOINT
+  : `http://${env.MINIO_ENDPOINT}:${env.MINIO_PORT}`;
+
 export const s3Client = new S3Client({
-  endpoint: `http://${env.MINIO_ENDPOINT}:${env.MINIO_PORT}`,
-  region: 'us-east-1',
+  endpoint: endpointUrl,
+  region: env.MINIO_REGION,
   credentials: {
     accessKeyId: env.MINIO_ACCESS_KEY,
     secretAccessKey: env.MINIO_SECRET_KEY,
   },
-  forcePathStyle: true,
+  forcePathStyle: env.MINIO_FORCE_PATH_STYLE !== 'false',
 });
 
 const BUCKET = env.MINIO_BUCKET;
