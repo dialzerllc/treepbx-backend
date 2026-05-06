@@ -111,17 +111,25 @@ session:execute('record_session', local_path .. ' ' .. tostring(record_sec))
 session:sleep(record_sec * 1000 + 200)
 session:execute('stop_record_session', local_path)
 
--- 3. Upload to ctl02 in one multipart request. ctl02 handles R2 storage,
---    STT, LLM, and writes the amd_decisions audit row, returning the
---    verdict synchronously.
+-- 3. Upload to ctl02. The FS container (safarov image) has busybox wget but
+--    no curl, so we POST the audio as the raw body and pass metadata as URL
+--    query params. ctl02 reads the body as Buffer, headers/query for context.
+local function url_encode(s)
+  return (tostring(s or ''):gsub('([^%w%-%.%_%~])', function(c)
+    return string.format('%%%02X', string.byte(c))
+  end))
+end
+local query = '?call_id=' .. url_encode(call_id)
+              .. '&probe_text=' .. url_encode(probe_text or '')
+if eval_prompt and eval_prompt ~= '' then
+  query = query .. '&eval_prompt=' .. url_encode(eval_prompt)
+end
 local cmd = table.concat({
-  "curl -sS -m 8 -X POST",
-  "-H " .. shellquote('Authorization: Bearer ' .. cb_token),
-  "-F " .. shellquote('file=@' .. local_path),
-  "-F " .. shellquote('call_id=' .. call_id),
-  "-F " .. shellquote('probe_text=' .. probe_text),
-  (eval_prompt ~= '') and ("-F " .. shellquote('eval_prompt=' .. eval_prompt)) or '',
-  shellquote(callback),
+  "wget -q -O -",
+  "--header=" .. shellquote('Authorization: Bearer ' .. cb_token),
+  "--header=" .. shellquote('Content-Type: audio/wav'),
+  "--post-file=" .. shellquote(local_path),
+  shellquote(callback .. query),
 }, ' ')
 local handle = io.popen(cmd, 'r')
 local resp = handle and handle:read('*a') or ''

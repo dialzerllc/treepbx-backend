@@ -6,7 +6,7 @@ import { mediaNodes, amdDecisions, calls, campaigns } from '../db/schema';
 import { BadRequest, Unauthorized, NotFound } from '../lib/errors';
 import { logger } from '../lib/logger';
 import { spawn } from 'child_process';
-import { getFileBuffer } from '../integrations/minio';
+import { getFileBuffer, uploadFile } from '../integrations/minio';
 import { transcribeBuffer, evalProbe, DEFAULT_AI_SCREEN_EVAL_PROMPT } from '../integrations/gpu';
 
 const router = new Hono();
@@ -202,80 +202,102 @@ router.post('/media-nodes/:id/drain', async (c) => {
  */
 /**
  * POST /internal/ai-probe
- * Called by ai-screen.lua mid-call after it captures the called party's
- * response to the probe prompt. Body: { callId, audioKey, probeText }.
+ * Called by ai-screen.lua mid-call. Multipart fields:
+ *   file        — captured response audio (~4s WAV).
+ *   call_id     — treepbx call.id (UUID).
+ *   probe_text  — the prompt the bot played.
+ *   eval_prompt — optional override of the LLM system prompt.
  *
- * Flow: fetch audio bytes from R2 → STT → LLM verdict → reply with
- * decision and write an amd_decisions audit row. The lua acts on the
- * returned decision (bridge to agent vs hangup) within ~1.5s.
+ * Flow: receive file → upload to R2 (audit/<tenantId>/<callId>-probe.wav)
+ *       → STT → LLM verdict → write amd_decisions row → return
+ *       {decision, is_human, transcript, reason, latency_ms}.
  *
- * Errors are mapped into is_human=true (safer default) so the lua never
- * drops a real call due to a transient GPU failure.
+ * Errors map into is_human=true (fail-open). A live call should never be
+ * dropped because of a transient GPU/R2 blip — the worst case is bridging
+ * to an agent who hangs up; the best case (with our infra healthy) is
+ * filtering the recording.
  */
-const aiProbeBody = z.object({
-  callId: z.string().uuid(),
-  audioKey: z.string().min(1),
-  probeText: z.string().min(1).max(1000),
-  evalPrompt: z.string().optional(),
-});
 router.post('/ai-probe', async (c) => {
   const t0 = Date.now();
-  const body = aiProbeBody.parse(await c.req.json());
+  // Body is raw audio bytes (audio/wav). Metadata is in URL query params:
+  // call_id, probe_text, eval_prompt. Lua uses busybox wget which supports
+  // --post-file but not multipart, so this is the simplest contract.
+  const callId = c.req.query('call_id') ?? '';
+  const probeText = c.req.query('probe_text') ?? '';
+  const evalPrompt = c.req.query('eval_prompt') ?? '';
 
-  // Look up call → campaign for tenant scoping + audit row.
+  if (!callId || !probeText) {
+    throw new BadRequest('missing call_id or probe_text');
+  }
+  if (!/^[0-9a-f-]{36}$/i.test(callId)) {
+    throw new BadRequest('invalid call_id');
+  }
+  const audioBuf = Buffer.from(await c.req.arrayBuffer());
+  if (audioBuf.length === 0) {
+    throw new BadRequest('empty audio body');
+  }
+
   const [call] = await db.select({
     id: calls.id,
     tenantId: calls.tenantId,
     campaignId: calls.campaignId,
-  }).from(calls).where(eq(calls.id, body.callId));
+  }).from(calls).where(eq(calls.id, callId));
+
+  if (!call) {
+    throw new NotFound('call not found for ai-probe');
+  }
 
   let isHuman = true;
   let reason = '';
   let transcriptText = '';
   let llmRaw = '';
-  let errorOccurred = false;
+  let audioKey: string | null = null;
 
   try {
-    const audio = await getFileBuffer(body.audioKey);
-    const { text } = await transcribeBuffer(audio);
-    transcriptText = text;
+    audioKey = `audit/${call.tenantId}/${callId}-probe.wav`;
+    // Upload audio to R2 in parallel with STT — STT doesn't depend on R2.
+    const [, sttResult] = await Promise.all([
+      uploadFile(audioKey, audioBuf, 'audio/wav').catch((e) => {
+        logger.warn({ err: e?.message ?? String(e), audioKey }, '[ai-probe] R2 upload failed (audit row will lack audio key)');
+        audioKey = null;
+        return null;
+      }),
+      transcribeBuffer(audioBuf),
+    ]);
+    transcriptText = sttResult.text;
+
     const verdict = await evalProbe({
-      systemPrompt: body.evalPrompt || DEFAULT_AI_SCREEN_EVAL_PROMPT,
-      probeText: body.probeText,
-      responseTranscript: text,
+      systemPrompt: evalPrompt || DEFAULT_AI_SCREEN_EVAL_PROMPT,
+      probeText,
+      responseTranscript: transcriptText,
     });
     isHuman = verdict.isHuman;
     reason = verdict.reason;
     llmRaw = verdict.raw;
   } catch (err: any) {
-    errorOccurred = true;
     reason = `error: ${err?.message ?? String(err)}`.slice(0, 240);
-    logger.error({ err: err?.message ?? String(err), callId: body.callId }, '[ai-probe] failed — defaulting to is_human=true');
-    // isHuman stays true — fail-open so live calls aren't dropped on infra blips.
+    logger.error({ err: err?.message ?? String(err), callId }, '[ai-probe] failed — defaulting to is_human=true');
   }
 
   const totalMs = Date.now() - t0;
 
-  // Persist audit row regardless of pipeline outcome.
-  if (call) {
-    await db.insert(amdDecisions).values({
-      callId: call.id,
-      campaignId: call.campaignId ?? null,
-      tenantId: call.tenantId ?? null,
-      source: 'ai_screen',
-      amdResult: isHuman ? 'human' : 'machine',
-      action: isHuman ? 'bridge' : 'hangup',
-      audioKey: body.audioKey,
-      probeText: body.probeText,
-      transcript: transcriptText,
-      reason: reason.slice(0, 240),
-      llmRaw: llmRaw.slice(0, 4000),
-      decidedAtMs: totalMs,
-      totalLatencyMs: totalMs,
-    }).catch((e) => {
-      logger.warn({ err: e?.message ?? String(e), callId: body.callId }, '[ai-probe] audit insert failed (non-fatal)');
-    });
-  }
+  await db.insert(amdDecisions).values({
+    callId: call.id,
+    campaignId: call.campaignId ?? null,
+    tenantId: call.tenantId ?? null,
+    source: 'ai_screen',
+    amdResult: isHuman ? 'human' : 'machine',
+    action: isHuman ? 'bridge' : 'hangup',
+    audioKey,
+    probeText,
+    transcript: transcriptText,
+    reason: reason.slice(0, 240),
+    llmRaw: llmRaw.slice(0, 4000),
+    decidedAtMs: totalMs,
+    totalLatencyMs: totalMs,
+  }).catch((e) => {
+    logger.warn({ err: e?.message ?? String(e), callId }, '[ai-probe] audit insert failed (non-fatal)');
+  });
 
   return c.json({
     decision: isHuman ? 'bridge' : 'hangup',
@@ -283,7 +305,6 @@ router.post('/ai-probe', async (c) => {
     transcript: transcriptText,
     reason,
     latency_ms: totalMs,
-    error: errorOccurred ? reason : undefined,
   });
 });
 
