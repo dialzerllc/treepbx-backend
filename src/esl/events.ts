@@ -1,6 +1,6 @@
 import { eslClient } from './client';
 import { db } from '../db/client';
-import { calls, carriers, users, leads, tenants, plans, rateGroups, rateCards, dids } from '../db/schema';
+import { calls, carriers, users, leads, tenants, plans, rateGroups, rateCards, dids, amdDecisions } from '../db/schema';
 import { eq, and, isNull } from 'drizzle-orm';
 import { publishCallRinging, publishCallEnded, publishAgentStatus, publishCampaignDashboard } from '../ws/publisher';
 import { billingQueue } from '../lib/queue';
@@ -310,6 +310,51 @@ export function startESLEventListener() {
               ...(packetLossPct && { packetLossPct: String(packetLossPct) }),
               ...(amdResult && { amdResult }),
             }).where(eq(calls.freeswitchUuid, uuid));
+
+            // Audit row for the avmd path. The ai-screen path writes its own
+            // row directly from /internal/ai-probe (with audio_key + LLM
+            // verdict), so we skip here when ai_probe_transcript was set —
+            // that channel var is the marker of an ai-screen call.
+            // For the avmd-only path (broadcast / amd-screen), this row gives
+            // silver-layer compliance evidence: timestamps + classifier
+            // output + final action + reason. Audio capture for the avmd
+            // path is a follow-up.
+            if (amdResult && !headers['variable_ai_probe_transcript']) {
+              try {
+                const [callRow] = await db.select({
+                  id: calls.id,
+                  tenantId: calls.tenantId,
+                  campaignId: calls.campaignId,
+                }).from(calls).where(eq(calls.freeswitchUuid, uuid)).limit(1);
+                if (callRow?.campaignId) {
+                  // Source = 'broadcast' if voice-broadcast.lua ran (bcast_*
+                  // channel vars present), else 'avmd' (amd-screen.lua or
+                  // pre-existing inline AMD).
+                  const source = headers['variable_bcast_audio_url'] ? 'broadcast' : 'avmd';
+                  const action = (headers['variable_amd_action']
+                    ?? headers['variable_bcast_amd_action']
+                    ?? (amdResult === 'machine' ? 'hangup' : 'bridge'));
+                  const reason = `avmd_detect=${headers['variable_avmd_detect'] ?? 'null'}`;
+                  await db.insert(amdDecisions).values({
+                    callId: callRow.id,
+                    campaignId: callRow.campaignId,
+                    tenantId: callRow.tenantId ?? null,
+                    source,
+                    amdResult,
+                    action,
+                    audioKey: null,
+                    probeText: null,
+                    transcript: null,
+                    reason: reason.slice(0, 240),
+                    llmRaw: null,
+                    decidedAtMs: null,
+                    totalLatencyMs: null,
+                  });
+                }
+              } catch (err: any) {
+                logger.warn({ err: err?.message ?? String(err), uuid }, '[ESL] amd_decisions insert failed (non-fatal)');
+              }
+            }
 
             // Dispatch billing if call had duration
             if (billSec > 0) {

@@ -20,6 +20,7 @@ import stirShakenRouter from './stir-shaken.routes';
 import monitoringRouter from './monitoring.routes';
 import liveCallsRouter from './live-calls.routes';
 import reportsRouter from './reports.routes';
+import amdDecisionsRouter from './amd-decisions.routes';
 import metricsRouter from './metrics.routes';
 import callTraceRouter from './call-trace.routes';
 import serviceMetricTargetsRouter from './service-metric-targets.routes';
@@ -71,6 +72,7 @@ tenant.route('/live-calls', liveCallsRouter);
 
 // Reports (supervisor/admin — enforced inside routes)
 tenant.route('/reports', reportsRouter);
+tenant.route('/amd-decisions', amdDecisionsRouter);
 tenant.route('/metrics', metricsRouter);
 tenant.route('/call-trace', callTraceRouter);
 tenant.route('/metric-targets', serviceMetricTargetsRouter);
