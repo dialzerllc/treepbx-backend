@@ -194,6 +194,17 @@ ssh $SSH_OPTS root@"$FS_IP" "docker exec fs sh -c '
   sed -i \"s|<param name=\\\"apply-inbound-acl\\\" value=\\\"domains\\\"/>|<!-- apply-inbound-acl removed: digest auth + directory password gate registration -->|\" /etc/freeswitch/sip_profiles/internal.xml
 '"
 
+# 3b. mod_avmd — Answering Machine / Voicemail Detection. Used by voice
+# broadcast campaigns to classify HUMAN vs MACHINE on answer (avmd_detect)
+# and to wait for the voicemail beep before dropping a recorded message
+# (avmd::beep event). Idempotent: skipped if the load directive is already
+# present. mod_avmd ships in the safarov image but is not loaded by default.
+ssh $SSH_OPTS root@"$FS_IP" "docker exec fs sh -c '
+  CFG=/etc/freeswitch/autoload_configs/modules.conf.xml
+  grep -q \"<load module=\\\"mod_avmd\\\"/>\" \$CFG || \
+    sed -i \"/<load module=\\\"mod_av\\\"\\/>/a\\    <load module=\\\"mod_avmd\\\"\\/>\" \$CFG
+'"
+
 # 4. UFW: allow 5060 + 5080 from each sip_proxy IP (FIP and primary). RTP
 # range stays open since RTP arrives from arbitrary peer IPs and the trust
 # decision lives at the SIP layer (only ACL'd peers ever negotiated SDP).
@@ -214,6 +225,11 @@ ssh $SSH_OPTS root@"$FS_IP" "
 #    re-bootstrap doesn't sever live softphone WS connections.
 ssh $SSH_OPTS root@"$FS_IP" "docker exec fs fs_cli -p $ESL_PW -x 'reloadacl' >/dev/null"
 ssh $SSH_OPTS root@"$FS_IP" "docker exec fs fs_cli -p $ESL_PW -x 'reloadxml'  >/dev/null"
+
+# Load mod_avmd at runtime (no container restart needed). The XML edit above
+# guarantees it auto-loads on next FS startup; this line makes it available
+# immediately on the very first bootstrap. Already-loaded errors are ignored.
+ssh $SSH_OPTS root@"$FS_IP" "docker exec fs fs_cli -p $ESL_PW -x 'load mod_avmd' >/dev/null 2>&1 || true"
 
 HASH_AFTER=$(ssh $SSH_OPTS root@"$FS_IP" "docker exec fs sh -c 'sha256sum /etc/freeswitch/sip_profiles/external.xml /etc/freeswitch/sip_profiles/internal.xml /etc/freeswitch/vars.xml 2>/dev/null'" || echo "")
 
