@@ -275,30 +275,47 @@ async function dialLoop(state: DialerState) {
     }).from(campaigns).where(eq(campaigns.id, state.campaignId));
     const isBroadcast = !!campaign?.broadcastEnabled;
 
-    // Resolve broadcast/voicemail audio file URLs once per tick. mod_http_cache
-    // on the FS workers caches the file on first fetch, so the presigned URL
-    // expiry only matters for that first call — subsequent calls play from
-    // local disk. We use 1h expiry which comfortably outlives any single tick.
+    // Resolve audio file URLs once per tick. mod_http_cache on the FS workers
+    // caches the file on first fetch, so the presigned URL expiry only matters
+    // for that first call — subsequent calls play from local disk. We use 1h
+    // expiry which comfortably outlives any single tick. Resolved URLs:
+    //   bcastAudioUrl  — broadcast HUMAN audio (broadcastAudioId).
+    //   bcastVmUrl     — voicemail audio for amd_action=leave_voicemail (vmAudioId).
+    //                    Same field is reused across broadcast and non-broadcast.
+    //   amdAudioUrl    — AMD play_message audio. amdTransferTarget is dual-purpose:
+    //                    it stores a UUID (audio file id) when amd_action=play_message
+    //                    and a phone number when amd_action=transfer.
     let bcastAudioUrl: string | null = null;
     let bcastVmUrl: string | null = null;
-    if (isBroadcast) {
+    let amdAudioUrl: string | null = null;
+    let amdVmUrl: string | null = null;
+    {
       const { audioFiles } = await import('../db/schema');
       const { getFileUrl } = await import('../integrations/minio');
-      const ids = [campaign?.broadcastAudioId, campaign?.vmAudioId].filter(Boolean) as string[];
+      const ids: string[] = [];
+      if (isBroadcast && campaign?.broadcastAudioId) ids.push(campaign.broadcastAudioId);
+      if (campaign?.vmAudioId) ids.push(campaign.vmAudioId);
+      const isUuid = (s: string | null | undefined) => !!s && /^[0-9a-f-]{36}$/i.test(s);
+      if (campaign?.amdEnabled && campaign.amdAction === 'play_message' && isUuid(campaign.amdTransferTarget)) {
+        ids.push(campaign.amdTransferTarget!);
+      }
       if (ids.length > 0) {
         const rows = await db.select({ id: audioFiles.id, key: audioFiles.minioKey })
           .from(audioFiles).where(inArray(audioFiles.id, ids));
         const byId = new Map(rows.map((r) => [r.id, r.key]));
-        if (campaign?.broadcastAudioId) {
-          const k = byId.get(campaign.broadcastAudioId);
-          if (k) bcastAudioUrl = await getFileUrl(k, 3600);
-        }
-        if (campaign?.vmAudioId) {
-          const k = byId.get(campaign.vmAudioId);
-          if (k) bcastVmUrl = await getFileUrl(k, 3600);
+        const resolve = async (id?: string | null) => {
+          if (!id) return null;
+          const key = byId.get(id);
+          return key ? await getFileUrl(key, 3600) : null;
+        };
+        if (isBroadcast) bcastAudioUrl = await resolve(campaign?.broadcastAudioId);
+        bcastVmUrl = await resolve(campaign?.vmAudioId);
+        amdVmUrl = bcastVmUrl; // shared field; same audio used in either path
+        if (campaign?.amdEnabled && campaign.amdAction === 'play_message' && isUuid(campaign.amdTransferTarget)) {
+          amdAudioUrl = await resolve(campaign.amdTransferTarget);
         }
       }
-      if (!bcastAudioUrl) {
+      if (isBroadcast && !bcastAudioUrl) {
         logger.warn({ campaignId: state.campaignId, broadcastAudioId: campaign?.broadcastAudioId }, 'broadcast: no audio file resolved — calls will be skipped');
       }
     }
@@ -478,16 +495,25 @@ async function dialLoop(state: DialerState) {
           ...(agent ? [`treepbx_agent_id=${agent.id}`] : []),
           `treepbx_tenant_id=${state.tenantId}`,
         ];
-        // AMD wiring (mod_avmd) — only used in non-broadcast mode. In broadcast
-        // mode, the voice-broadcast.lua orchestrator runs avmd_start itself
-        // after answer so it can synchronously read avmd_detect and branch
-        // (HUMAN→play, MACHINE→hangup or wait-for-beep+VM).
-        if (!isBroadcast && campaign?.amdEnabled) {
-          varList.push(`execute_on_media='avmd start'`);
-          varList.push(`execute_on_avmd_beep='set amd_result=machine'`);
-          varList.push(`avmd-inbound-channel=true`);
-          if (campaign.amdAction === 'hangup') {
-            varList.push(`execute_on_avmd_beep_2='hangup MACHINE_DETECTED'`);
+        // AMD wiring (mod_avmd) for non-broadcast modes — channel vars are
+        // read by amd-screen.lua which we hand off to as the originate's
+        // bridge app (see bridgeApp construction below). The lua synchronously
+        // classifies HUMAN vs MACHINE; HUMAN bridges to the agent extension,
+        // MACHINE applies amd_action (hangup | transfer | play_message |
+        // leave_voicemail). Setting amd_result=machine on hangup signals
+        // events.ts to free the agent immediately (no wrap-up).
+        if (!isBroadcast && campaign?.amdEnabled && agent) {
+          varList.push(`amd_timeout_ms=${campaign.amdTimeoutMs ?? 3500}`);
+          varList.push(`amd_action=${campaign.amdAction ?? 'hangup'}`);
+          varList.push(`amd_bridge_target=user/${agent.sipUsername || agent.id}`);
+          if (campaign.amdAction === 'transfer' && campaign.amdTransferTarget) {
+            varList.push(`amd_transfer_target=${campaign.amdTransferTarget}`);
+          }
+          if (campaign.amdAction === 'play_message' && amdAudioUrl) {
+            varList.push(`amd_audio_url='${amdAudioUrl}'`);
+          }
+          if (campaign.amdAction === 'leave_voicemail' && amdVmUrl) {
+            varList.push(`amd_vm_url='${amdVmUrl}'`);
           }
         }
 
@@ -514,20 +540,29 @@ async function dialLoop(state: DialerState) {
         // reads bcast_* channel vars and orchestrates AMD detection, audio
         // playback (via mod_http_cache from R2 presigned URL), DTMF capture
         // for press-1 transfer, and voicemail-beep wait + drop.
+        //
+        // Non-broadcast + AMD enabled: hand off to amd-screen.lua, which
+        // classifies HUMAN/MACHINE then either bridges to the agent (HUMAN)
+        // or applies amd_action (MACHINE). Sets amd_result=machine on hangup
+        // so events.ts frees the agent without running the wrap-up timer.
+        //
+        // Non-broadcast + AMD disabled: original behavior — direct &bridge
+        // with no screening. Fastest path for campaigns that don't care.
         let bridgeApp: string;
         if (isBroadcast) {
           if (!bcastAudioUrl) {
-            // No audio resolved — skip this lead, restore status, free CDR.
             await db.update(calls).set({ status: 'failed', hangupCause: 'NO_BROADCAST_AUDIO', endedAt: new Date() }).where(eq(calls.id, call.id));
             await db.update(leads).set({ status: 'pending' }).where(eq(leads.id, lead.id));
             continue;
           }
           bridgeApp = `&lua(voice-broadcast.lua)`;
         } else {
-          // Non-broadcast — agent is guaranteed to be set (loop only runs
-          // when availableAgents.length > 0 in non-broadcast mode).
           const agentExtFs = agent!.sipUsername || agent!.id;
-          bridgeApp = `&bridge(user/${agentExtFs})`;
+          if (campaign?.amdEnabled) {
+            bridgeApp = `&lua(amd-screen.lua)`;
+          } else {
+            bridgeApp = `&bridge(user/${agentExtFs})`;
+          }
         }
         const cmd = `originate {${vars}}${dialString} ${bridgeApp}`;
         // Async bgapi: when FS replies (with the BACKGROUND_JOB event), settle

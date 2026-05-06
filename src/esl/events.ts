@@ -188,13 +188,18 @@ export function startESLEventListener() {
               if (call.agentId) {
                 const agentId = call.agentId;
                 const tenantId = call.tenantId;
+                const amdResult = headers['variable_amd_result'];
                 const isFailedCall = hangupCause !== 'NORMAL_CLEARING' && hangupCause !== 'ORIGINATOR_CANCEL';
+                // AMD-screened machine: agent never spoke to anyone, so skip
+                // wrap-up entirely. amd-screen.lua sets amd_result=machine
+                // before hangup for any MACHINE branch (hangup, transfer,
+                // play_message, leave_voicemail).
+                const amdMachine = amdResult === 'machine';
 
-                if (isFailedCall) {
-                  // Failed call — set agent back to available immediately (no wrap-up needed)
+                if (isFailedCall || amdMachine) {
                   await db.update(users).set({ status: 'available', statusChangedAt: new Date() }).where(eq(users.id, agentId));
                   publishAgentStatus(tenantId, agentId, 'available');
-                  logger.info({ agentId, hangupCause }, 'Agent set to available (call failed)');
+                  logger.info({ agentId, hangupCause, amdMachine }, amdMachine ? 'Agent set to available (AMD machine, no bridge)' : 'Agent set to available (call failed)');
                 } else {
                   // Normal call ended — wrap-up then auto-available
                   publishAgentStatus(tenantId, agentId, 'wrap_up');

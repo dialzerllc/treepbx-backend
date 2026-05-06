@@ -216,10 +216,12 @@ PAYLOAD_DIR="$(dirname "$0")/freeswitch-payload"
 if [ -d "$PAYLOAD_DIR" ]; then
   scp $SSH_OPTS "$PAYLOAD_DIR/voice-broadcast.lua" root@"$FS_IP":/tmp/voice-broadcast.lua >/dev/null
   scp $SSH_OPTS "$PAYLOAD_DIR/02_voice_broadcast.xml" root@"$FS_IP":/tmp/02_voice_broadcast.xml >/dev/null
+  scp $SSH_OPTS "$PAYLOAD_DIR/amd-screen.lua" root@"$FS_IP":/tmp/amd-screen.lua >/dev/null
   ssh $SSH_OPTS root@"$FS_IP" "
     docker cp /tmp/voice-broadcast.lua fs:/usr/share/freeswitch/scripts/voice-broadcast.lua
     docker cp /tmp/02_voice_broadcast.xml fs:/etc/freeswitch/dialplan/default/02_voice_broadcast.xml
-    rm -f /tmp/voice-broadcast.lua /tmp/02_voice_broadcast.xml
+    docker cp /tmp/amd-screen.lua fs:/usr/share/freeswitch/scripts/amd-screen.lua
+    rm -f /tmp/voice-broadcast.lua /tmp/02_voice_broadcast.xml /tmp/amd-screen.lua
   "
 fi
 
