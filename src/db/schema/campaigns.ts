@@ -23,6 +23,7 @@ export const campaigns = pgTable('campaigns', {
   // answer instead of bridging to an agent. No agent required to dial.
   broadcastEnabled: boolean('broadcast_enabled').default(false),
   broadcastAudioId: uuid('broadcast_audio_id'),
+  vmAudioId: uuid('vm_audio_id'),
   maxAbandonRate: numeric('max_abandon_rate', { precision: 5, scale: 2 }).default('3.0'),
   wrapUpSeconds: integer('wrap_up_seconds').default(30),
   ringTimeoutSeconds: integer('ring_timeout_seconds').default(25),

@@ -269,8 +269,39 @@ async function dialLoop(state: DialerState) {
       amdTransferTarget: campaigns.amdTransferTarget,
       broadcastEnabled: campaigns.broadcastEnabled,
       broadcastAudioId: campaigns.broadcastAudioId,
+      vmAudioId: campaigns.vmAudioId,
+      transferEnabled: campaigns.transferEnabled,
+      transferTarget: campaigns.transferTarget,
     }).from(campaigns).where(eq(campaigns.id, state.campaignId));
     const isBroadcast = !!campaign?.broadcastEnabled;
+
+    // Resolve broadcast/voicemail audio file URLs once per tick. mod_http_cache
+    // on the FS workers caches the file on first fetch, so the presigned URL
+    // expiry only matters for that first call — subsequent calls play from
+    // local disk. We use 1h expiry which comfortably outlives any single tick.
+    let bcastAudioUrl: string | null = null;
+    let bcastVmUrl: string | null = null;
+    if (isBroadcast) {
+      const { audioFiles } = await import('../db/schema');
+      const { getFileUrl } = await import('../integrations/minio');
+      const ids = [campaign?.broadcastAudioId, campaign?.vmAudioId].filter(Boolean) as string[];
+      if (ids.length > 0) {
+        const rows = await db.select({ id: audioFiles.id, key: audioFiles.minioKey })
+          .from(audioFiles).where(inArray(audioFiles.id, ids));
+        const byId = new Map(rows.map((r) => [r.id, r.key]));
+        if (campaign?.broadcastAudioId) {
+          const k = byId.get(campaign.broadcastAudioId);
+          if (k) bcastAudioUrl = await getFileUrl(k, 3600);
+        }
+        if (campaign?.vmAudioId) {
+          const k = byId.get(campaign.vmAudioId);
+          if (k) bcastVmUrl = await getFileUrl(k, 3600);
+        }
+      }
+      if (!bcastAudioUrl) {
+        logger.warn({ campaignId: state.campaignId, broadcastAudioId: campaign?.broadcastAudioId }, 'broadcast: no audio file resolved — calls will be skipped');
+      }
+    }
 
     // Caller-ID DID pool — when the campaign has a DID group, fetch every
     // active DID in the group (ordered by created_at for stable round-robin)
@@ -447,17 +478,30 @@ async function dialLoop(state: DialerState) {
           ...(agent ? [`treepbx_agent_id=${agent.id}`] : []),
           `treepbx_tenant_id=${state.tenantId}`,
         ];
-        // AMD wiring (mod_avmd) — start avmd at media negotiation. avmd fires
-        // an avmd::beep event when it detects voicemail; we then set
-        // amd_result=machine on the channel via execute_on_avmd_beep so it
-        // surfaces on hangup_complete via variable_amd_result.
-        if (campaign?.amdEnabled) {
+        // AMD wiring (mod_avmd) — only used in non-broadcast mode. In broadcast
+        // mode, the voice-broadcast.lua orchestrator runs avmd_start itself
+        // after answer so it can synchronously read avmd_detect and branch
+        // (HUMAN→play, MACHINE→hangup or wait-for-beep+VM).
+        if (!isBroadcast && campaign?.amdEnabled) {
           varList.push(`execute_on_media='avmd start'`);
           varList.push(`execute_on_avmd_beep='set amd_result=machine'`);
           varList.push(`avmd-inbound-channel=true`);
           if (campaign.amdAction === 'hangup') {
             varList.push(`execute_on_avmd_beep_2='hangup MACHINE_DETECTED'`);
           }
+        }
+
+        // Broadcast channel vars — read by voice-broadcast.lua on answer.
+        if (isBroadcast) {
+          if (bcastAudioUrl) varList.push(`bcast_audio_url='${bcastAudioUrl}'`);
+          if (bcastVmUrl) varList.push(`bcast_vm_url='${bcastVmUrl}'`);
+          varList.push(`bcast_amd_enabled=${campaign?.amdEnabled ? 'true' : 'false'}`);
+          varList.push(`bcast_amd_timeout_ms=${campaign?.amdTimeoutMs ?? 3500}`);
+          varList.push(`bcast_amd_action=${campaign?.amdAction ?? 'hangup'}`);
+          if (campaign?.amdTransferTarget) varList.push(`bcast_amd_xfer_target=${campaign.amdTransferTarget}`);
+          varList.push(`bcast_xfer_enabled=${campaign?.transferEnabled ? 'true' : 'false'}`);
+          if (campaign?.transferTarget) varList.push(`bcast_xfer_target=${campaign.transferTarget}`);
+          varList.push(`bcast_xfer_digit=1`);
         }
         const vars = varList.join(',');
 
@@ -466,14 +510,19 @@ async function dialLoop(state: DialerState) {
           .map(gw => `sofia/gateway/${gw}/${lead.phone}`)
           .join('|');
 
-        // Broadcast mode: play audio on answer, then hang up. No agent bridge.
-        // V1 plays FS's built-in hold music — real audio file integration
-        // (broadcastAudioId → MinIO bytes → FS playback) is a follow-up; FS
-        // would need a public unauth endpoint or local file deploy to
-        // dereference our audio_files rows.
+        // Broadcast mode: hand off to voice-broadcast.lua on answer. The lua
+        // reads bcast_* channel vars and orchestrates AMD detection, audio
+        // playback (via mod_http_cache from R2 presigned URL), DTMF capture
+        // for press-1 transfer, and voicemail-beep wait + drop.
         let bridgeApp: string;
         if (isBroadcast) {
-          bridgeApp = `&playback($\${hold_music})`;
+          if (!bcastAudioUrl) {
+            // No audio resolved — skip this lead, restore status, free CDR.
+            await db.update(calls).set({ status: 'failed', hangupCause: 'NO_BROADCAST_AUDIO', endedAt: new Date() }).where(eq(calls.id, call.id));
+            await db.update(leads).set({ status: 'pending' }).where(eq(leads.id, lead.id));
+            continue;
+          }
+          bridgeApp = `&lua(voice-broadcast.lua)`;
         } else {
           // Non-broadcast — agent is guaranteed to be set (loop only runs
           // when availableAgents.length > 0 in non-broadcast mode).

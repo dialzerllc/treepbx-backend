@@ -194,16 +194,34 @@ ssh $SSH_OPTS root@"$FS_IP" "docker exec fs sh -c '
   sed -i \"s|<param name=\\\"apply-inbound-acl\\\" value=\\\"domains\\\"/>|<!-- apply-inbound-acl removed: digest auth + directory password gate registration -->|\" /etc/freeswitch/sip_profiles/internal.xml
 '"
 
-# 3b. mod_avmd — Answering Machine / Voicemail Detection. Used by voice
-# broadcast campaigns to classify HUMAN vs MACHINE on answer (avmd_detect)
-# and to wait for the voicemail beep before dropping a recorded message
-# (avmd::beep event). Idempotent: skipped if the load directive is already
-# present. mod_avmd ships in the safarov image but is not loaded by default.
+# 3b. mod_avmd + mod_http_cache — voice broadcast dependencies.
+#   mod_avmd      → AMD/voicemail classification (avmd_detect, avmd::beep).
+#   mod_http_cache → plays audio from R2/HTTPS URLs with on-disk caching so
+#                    the second+ broadcast call to the same lead list reuses
+#                    the cached file instead of refetching from R2.
+# Both ship in the safarov image but neither is loaded by default. Idempotent.
 ssh $SSH_OPTS root@"$FS_IP" "docker exec fs sh -c '
   CFG=/etc/freeswitch/autoload_configs/modules.conf.xml
   grep -q \"<load module=\\\"mod_avmd\\\"/>\" \$CFG || \
     sed -i \"/<load module=\\\"mod_av\\\"\\/>/a\\    <load module=\\\"mod_avmd\\\"\\/>\" \$CFG
+  grep -q \"<load module=\\\"mod_http_cache\\\"/>\" \$CFG || \
+    sed -i \"/<load module=\\\"mod_avmd\\\"\\/>/a\\    <load module=\\\"mod_http_cache\\\"\\/>\" \$CFG
 '"
+
+# 3c. Voice broadcast payload — Lua orchestrator + dialplan extension.
+# Re-copied on every bootstrap so script edits flow to all workers without a
+# container rebuild. Lua reload is automatic on next invocation; dialplan
+# changes pick up via the reloadxml at section 5.
+PAYLOAD_DIR="$(dirname "$0")/freeswitch-payload"
+if [ -d "$PAYLOAD_DIR" ]; then
+  scp $SSH_OPTS "$PAYLOAD_DIR/voice-broadcast.lua" root@"$FS_IP":/tmp/voice-broadcast.lua >/dev/null
+  scp $SSH_OPTS "$PAYLOAD_DIR/02_voice_broadcast.xml" root@"$FS_IP":/tmp/02_voice_broadcast.xml >/dev/null
+  ssh $SSH_OPTS root@"$FS_IP" "
+    docker cp /tmp/voice-broadcast.lua fs:/usr/share/freeswitch/scripts/voice-broadcast.lua
+    docker cp /tmp/02_voice_broadcast.xml fs:/etc/freeswitch/dialplan/default/02_voice_broadcast.xml
+    rm -f /tmp/voice-broadcast.lua /tmp/02_voice_broadcast.xml
+  "
+fi
 
 # 4. UFW: allow 5060 + 5080 from each sip_proxy IP (FIP and primary). RTP
 # range stays open since RTP arrives from arbitrary peer IPs and the trust
@@ -226,10 +244,12 @@ ssh $SSH_OPTS root@"$FS_IP" "
 ssh $SSH_OPTS root@"$FS_IP" "docker exec fs fs_cli -p $ESL_PW -x 'reloadacl' >/dev/null"
 ssh $SSH_OPTS root@"$FS_IP" "docker exec fs fs_cli -p $ESL_PW -x 'reloadxml'  >/dev/null"
 
-# Load mod_avmd at runtime (no container restart needed). The XML edit above
-# guarantees it auto-loads on next FS startup; this line makes it available
-# immediately on the very first bootstrap. Already-loaded errors are ignored.
+# Load mod_avmd + mod_http_cache at runtime (no container restart needed).
+# The XML edits above guarantee they auto-load on next FS startup; these
+# lines make them available immediately on the very first bootstrap.
+# Already-loaded errors are ignored.
 ssh $SSH_OPTS root@"$FS_IP" "docker exec fs fs_cli -p $ESL_PW -x 'load mod_avmd' >/dev/null 2>&1 || true"
+ssh $SSH_OPTS root@"$FS_IP" "docker exec fs fs_cli -p $ESL_PW -x 'load mod_http_cache' >/dev/null 2>&1 || true"
 
 HASH_AFTER=$(ssh $SSH_OPTS root@"$FS_IP" "docker exec fs sh -c 'sha256sum /etc/freeswitch/sip_profiles/external.xml /etc/freeswitch/sip_profiles/internal.xml /etc/freeswitch/vars.xml 2>/dev/null'" || echo "")
 

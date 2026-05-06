@@ -1,0 +1,26 @@
+<include>
+  <!--
+    voice-broadcast — entry point for outbound campaigns in dialMode='broadcast'.
+    The dialer originates with destination_number=BROADCAST_<lead_id> after
+    setting bcast_* channel variables; this extension hands off to the lua
+    orchestrator which handles AMD classification, audio playback, and DTMF
+    transfer.
+
+    The transfer sub-extension (voice-broadcast-xfer) is invoked via
+    bind_meta_app from inside the lua script when the called party presses
+    the configured DTMF digit during playback. bridge target is read from
+    bcast_xfer_target_resolved which the lua sets just before arming DTMF.
+  -->
+  <extension name="voice-broadcast" continue="false">
+    <condition field="destination_number" expression="^BROADCAST_">
+      <action application="lua" data="voice-broadcast.lua"/>
+    </condition>
+  </extension>
+
+  <extension name="voice-broadcast-xfer" continue="false">
+    <condition field="destination_number" expression="^voice-broadcast-xfer$">
+      <action application="set" data="bcast_outcome=dtmf_transferred"/>
+      <action application="bridge" data="sofia/gateway/${default_outbound_gateway}/${bcast_xfer_target_resolved}"/>
+    </condition>
+  </extension>
+</include>
