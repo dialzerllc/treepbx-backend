@@ -2,10 +2,12 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { eq } from 'drizzle-orm';
 import { db } from '../db/client';
-import { mediaNodes } from '../db/schema';
+import { mediaNodes, amdDecisions, calls, campaigns } from '../db/schema';
 import { BadRequest, Unauthorized, NotFound } from '../lib/errors';
 import { logger } from '../lib/logger';
 import { spawn } from 'child_process';
+import { getFileBuffer } from '../integrations/minio';
+import { transcribeBuffer, evalProbe, DEFAULT_AI_SCREEN_EVAL_PROMPT } from '../integrations/gpu';
 
 const router = new Hono();
 
@@ -198,6 +200,93 @@ router.post('/media-nodes/:id/drain', async (c) => {
  * Node reads this on boot to fetch config (SIP creds, BYOC carriers, rate limits).
  * Keeps sensitive config out of the Packer image.
  */
+/**
+ * POST /internal/ai-probe
+ * Called by ai-screen.lua mid-call after it captures the called party's
+ * response to the probe prompt. Body: { callId, audioKey, probeText }.
+ *
+ * Flow: fetch audio bytes from R2 → STT → LLM verdict → reply with
+ * decision and write an amd_decisions audit row. The lua acts on the
+ * returned decision (bridge to agent vs hangup) within ~1.5s.
+ *
+ * Errors are mapped into is_human=true (safer default) so the lua never
+ * drops a real call due to a transient GPU failure.
+ */
+const aiProbeBody = z.object({
+  callId: z.string().uuid(),
+  audioKey: z.string().min(1),
+  probeText: z.string().min(1).max(1000),
+  evalPrompt: z.string().optional(),
+});
+router.post('/ai-probe', async (c) => {
+  const t0 = Date.now();
+  const body = aiProbeBody.parse(await c.req.json());
+
+  // Look up call → campaign for tenant scoping + audit row.
+  const [call] = await db.select({
+    id: calls.id,
+    tenantId: calls.tenantId,
+    campaignId: calls.campaignId,
+  }).from(calls).where(eq(calls.id, body.callId));
+
+  let isHuman = true;
+  let reason = '';
+  let transcriptText = '';
+  let llmRaw = '';
+  let errorOccurred = false;
+
+  try {
+    const audio = await getFileBuffer(body.audioKey);
+    const { text } = await transcribeBuffer(audio);
+    transcriptText = text;
+    const verdict = await evalProbe({
+      systemPrompt: body.evalPrompt || DEFAULT_AI_SCREEN_EVAL_PROMPT,
+      probeText: body.probeText,
+      responseTranscript: text,
+    });
+    isHuman = verdict.isHuman;
+    reason = verdict.reason;
+    llmRaw = verdict.raw;
+  } catch (err: any) {
+    errorOccurred = true;
+    reason = `error: ${err?.message ?? String(err)}`.slice(0, 240);
+    logger.error({ err: err?.message ?? String(err), callId: body.callId }, '[ai-probe] failed — defaulting to is_human=true');
+    // isHuman stays true — fail-open so live calls aren't dropped on infra blips.
+  }
+
+  const totalMs = Date.now() - t0;
+
+  // Persist audit row regardless of pipeline outcome.
+  if (call) {
+    await db.insert(amdDecisions).values({
+      callId: call.id,
+      campaignId: call.campaignId ?? null,
+      tenantId: call.tenantId ?? null,
+      source: 'ai_screen',
+      amdResult: isHuman ? 'human' : 'machine',
+      action: isHuman ? 'bridge' : 'hangup',
+      audioKey: body.audioKey,
+      probeText: body.probeText,
+      transcript: transcriptText,
+      reason: reason.slice(0, 240),
+      llmRaw: llmRaw.slice(0, 4000),
+      decidedAtMs: totalMs,
+      totalLatencyMs: totalMs,
+    }).catch((e) => {
+      logger.warn({ err: e?.message ?? String(e), callId: body.callId }, '[ai-probe] audit insert failed (non-fatal)');
+    });
+  }
+
+  return c.json({
+    decision: isHuman ? 'bridge' : 'hangup',
+    is_human: isHuman,
+    transcript: transcriptText,
+    reason,
+    latency_ms: totalMs,
+    error: errorOccurred ? reason : undefined,
+  });
+});
+
 router.get('/media-config', async (c) => {
   return c.json({
     // TODO: surface per-tenant BYOC carriers, rate cards, dispatcher endpoint, etc.

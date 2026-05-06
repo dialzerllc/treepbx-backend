@@ -24,6 +24,13 @@ export const campaigns = pgTable('campaigns', {
   broadcastEnabled: boolean('broadcast_enabled').default(false),
   broadcastAudioId: uuid('broadcast_audio_id'),
   vmAudioId: uuid('vm_audio_id'),
+  // AI-screen mode (dial_mode='ai_screen'): plays a probe prompt on HUMAN
+  // answer, captures 4s of response, runs STT + LLM-based relevance check,
+  // then bridges to an agent only if the response looks like a real person.
+  // Audit trail captured in amd_decisions table.
+  probePromptText: text('probe_prompt_text'),
+  probePromptAudioId: uuid('probe_prompt_audio_id'),
+  probeEvalPrompt: text('probe_eval_prompt'),
   maxAbandonRate: numeric('max_abandon_rate', { precision: 5, scale: 2 }).default('3.0'),
   wrapUpSeconds: integer('wrap_up_seconds').default(30),
   ringTimeoutSeconds: integer('ring_timeout_seconds').default(25),

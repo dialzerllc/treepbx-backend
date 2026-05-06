@@ -272,8 +272,12 @@ async function dialLoop(state: DialerState) {
       vmAudioId: campaigns.vmAudioId,
       transferEnabled: campaigns.transferEnabled,
       transferTarget: campaigns.transferTarget,
+      probePromptText: campaigns.probePromptText,
+      probePromptAudioId: campaigns.probePromptAudioId,
+      probeEvalPrompt: campaigns.probeEvalPrompt,
     }).from(campaigns).where(eq(campaigns.id, state.campaignId));
     const isBroadcast = !!campaign?.broadcastEnabled;
+    const isAiScreen = state.dialMode === 'ai_screen';
 
     // Resolve audio file URLs once per tick. mod_http_cache on the FS workers
     // caches the file on first fetch, so the presigned URL expiry only matters
@@ -289,6 +293,7 @@ async function dialLoop(state: DialerState) {
     let bcastVmUrl: string | null = null;
     let amdAudioUrl: string | null = null;
     let amdVmUrl: string | null = null;
+    let aiProbeUrl: string | null = null;
     {
       const { audioFiles } = await import('../db/schema');
       const { getFileUrl } = await import('../integrations/minio');
@@ -299,6 +304,7 @@ async function dialLoop(state: DialerState) {
       if (campaign?.amdEnabled && campaign.amdAction === 'play_message' && isUuid(campaign.amdTransferTarget)) {
         ids.push(campaign.amdTransferTarget!);
       }
+      if (isAiScreen && campaign?.probePromptAudioId) ids.push(campaign.probePromptAudioId);
       if (ids.length > 0) {
         const rows = await db.select({ id: audioFiles.id, key: audioFiles.minioKey })
           .from(audioFiles).where(inArray(audioFiles.id, ids));
@@ -314,9 +320,13 @@ async function dialLoop(state: DialerState) {
         if (campaign?.amdEnabled && campaign.amdAction === 'play_message' && isUuid(campaign.amdTransferTarget)) {
           amdAudioUrl = await resolve(campaign.amdTransferTarget);
         }
+        if (isAiScreen) aiProbeUrl = await resolve(campaign?.probePromptAudioId);
       }
       if (isBroadcast && !bcastAudioUrl) {
         logger.warn({ campaignId: state.campaignId, broadcastAudioId: campaign?.broadcastAudioId }, 'broadcast: no audio file resolved — calls will be skipped');
+      }
+      if (isAiScreen && !aiProbeUrl) {
+        logger.warn({ campaignId: state.campaignId, probePromptAudioId: campaign?.probePromptAudioId }, 'ai_screen: no probe audio resolved — calls will be skipped');
       }
     }
 
@@ -502,7 +512,7 @@ async function dialLoop(state: DialerState) {
         // MACHINE applies amd_action (hangup | transfer | play_message |
         // leave_voicemail). Setting amd_result=machine on hangup signals
         // events.ts to free the agent immediately (no wrap-up).
-        if (!isBroadcast && campaign?.amdEnabled && agent) {
+        if (!isBroadcast && !isAiScreen && campaign?.amdEnabled && agent) {
           varList.push(`amd_timeout_ms=${campaign.amdTimeoutMs ?? 3500}`);
           varList.push(`amd_action=${campaign.amdAction ?? 'hangup'}`);
           varList.push(`amd_bridge_target=user/${agent.sipUsername || agent.id}`);
@@ -515,6 +525,26 @@ async function dialLoop(state: DialerState) {
           if (campaign.amdAction === 'leave_voicemail' && amdVmUrl) {
             varList.push(`amd_vm_url='${amdVmUrl}'`);
           }
+        }
+
+        // AI-screen mode — push channel vars consumed by ai-screen.lua. The
+        // lua plays the pre-rendered probe TTS, records the response, and
+        // POSTs to ctl02 /internal/ai-probe for STT + LLM verdict before
+        // bridging to the agent.
+        if (isAiScreen && agent && aiProbeUrl) {
+          varList.push(`amd_timeout_ms=${campaign?.amdTimeoutMs ?? 3500}`);
+          varList.push(`amd_action=${campaign?.amdAction ?? 'hangup'}`);
+          varList.push(`amd_bridge_target=user/${agent.sipUsername || agent.id}`);
+          varList.push(`ai_probe_audio_url='${aiProbeUrl}'`);
+          varList.push(`ai_probe_text='${(campaign?.probePromptText ?? '').replace(/'/g, "")}'`);
+          if (campaign?.probeEvalPrompt) {
+            varList.push(`ai_eval_prompt='${campaign.probeEvalPrompt.replace(/'/g, '')}'`);
+          }
+          varList.push(`ai_record_seconds=4`);
+          const apiBase = process.env.PUBLIC_API_URL ?? 'http://5.161.127.127:3000';
+          varList.push(`ai_callback_url=${apiBase}/api/v1/internal/ai-probe`);
+          varList.push(`ai_callback_token=${process.env.BOOTSTRAP_TOKEN ?? ''}`);
+          varList.push(`ai_call_id=${call.id}`);
         }
 
         // Broadcast channel vars — read by voice-broadcast.lua on answer.
@@ -556,6 +586,13 @@ async function dialLoop(state: DialerState) {
             continue;
           }
           bridgeApp = `&lua(voice-broadcast.lua)`;
+        } else if (isAiScreen) {
+          if (!aiProbeUrl) {
+            await db.update(calls).set({ status: 'failed', hangupCause: 'NO_PROBE_AUDIO', endedAt: new Date() }).where(eq(calls.id, call.id));
+            await db.update(leads).set({ status: 'pending' }).where(eq(leads.id, lead.id));
+            continue;
+          }
+          bridgeApp = `&lua(ai-screen.lua)`;
         } else {
           const agentExtFs = agent!.sipUsername || agent!.id;
           if (campaign?.amdEnabled) {

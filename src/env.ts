@@ -18,6 +18,14 @@ const envSchema = z.object({
   PORT: z.coerce.number().default(3000),
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   CORS_ORIGIN: z.string().default('http://localhost:5173'),
+  // GPU server endpoints — used by ai-screen mode for STT/TTS/LLM verdicts.
+  // All optional so the backend still boots if the GPU box is offline; the
+  // ai-screen feature itself just becomes unavailable (campaigns can still
+  // be saved, but live calls error out fast at originate time).
+  GPU_STT_URL: z.string().url().optional(),
+  GPU_TTS_URL: z.string().url().optional(),
+  GPU_LLM_URL: z.string().url().optional(),
+  GPU_LLM_MODEL: z.string().default('llama3:latest'),
 });
 
 export const env = envSchema.parse(process.env);

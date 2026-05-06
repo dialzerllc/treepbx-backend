@@ -28,6 +28,7 @@ export * from './dnc-entries';
 // Calls
 export * from './calls';
 export * from './call-recordings';
+export * from './amd-decisions';
 
 // Agents & Teams
 export * from './teams';

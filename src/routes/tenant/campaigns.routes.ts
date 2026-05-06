@@ -2,7 +2,9 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { eq, and, like, desc, count, inArray, sql, isNull, isNotNull } from 'drizzle-orm';
 import { db } from '../../db/client';
-import { campaigns, leads, calls, users, dids, queues, ivrMenuActions, leadLists } from '../../db/schema';
+import { campaigns, leads, calls, users, dids, queues, ivrMenuActions, leadLists, audioFiles } from '../../db/schema';
+import { synthesizeTts } from '../../integrations/gpu';
+import { uploadFile } from '../../integrations/minio';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
 import { NotFound, BadRequest } from '../../lib/errors';
 import { requireRole } from '../../middleware/roles';
@@ -13,7 +15,7 @@ const router = new Hono();
 const campaignSchema = z.object({
   name: z.string().min(1),
   status: z.enum(['running', 'paused', 'draft', 'completed']).optional(),
-  dialMode: z.enum(['preview', 'progressive', 'predictive', 'power', 'voicebot']).default('progressive'),
+  dialMode: z.enum(['preview', 'progressive', 'predictive', 'power', 'voicebot', 'ai_screen']).default('progressive'),
   leadListId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
   leadListIds: z.array(z.string().uuid()).optional(),
   leadListStrategy: z.enum(['sequential', 'round_robin', 'ratio']).default('sequential'),
@@ -35,6 +37,9 @@ const campaignSchema = z.object({
   broadcastEnabled: z.boolean().nullable().default(false),
   broadcastAudioId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
   vmAudioId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
+  probePromptText: z.string().max(500).nullable().optional(),
+  probePromptAudioId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
+  probeEvalPrompt: z.string().max(4000).nullable().optional(),
   maxAbandonRate: z.union([z.number(), z.string()])
     .transform((v) => Number(v))
     .pipe(z.number().min(0).max(100))
@@ -676,6 +681,38 @@ router.post('/:id/test-call', requireRole('tenant_admin'), async (c) => {
 });
 
 // Create campaign
+/**
+ * Render the campaign's probe_prompt_text via the GPU TTS service, upload the
+ * resulting WAV to R2, insert an audio_files row, and return its UUID. Used
+ * by ai-screen mode to avoid per-call TTS latency: the prompt only changes on
+ * save, so we render once and play from cache for every subsequent call.
+ *
+ * Best-effort — failures are logged but do not block campaign save. The
+ * dialer logs a warning and skips ai-screen calls until the audio is set.
+ */
+async function renderProbePromptAudio(tenantId: string, campaignId: string, text: string): Promise<string | null> {
+  try {
+    const wav = await synthesizeTts(text);
+    const key = `audio/${tenantId}/probe-${campaignId}.wav`;
+    await uploadFile(key, wav, 'audio/wav');
+    const [row] = await db.insert(audioFiles).values({
+      tenantId,
+      name: `probe-${campaignId}`,
+      description: `AI-screen probe prompt (auto-generated TTS)`,
+      minioKey: key,
+      format: 'wav',
+      sizeBytes: wav.length,
+      source: 'tts',
+      ttsText: text,
+      category: 'ai_probe',
+    }).returning({ id: audioFiles.id });
+    return row?.id ?? null;
+  } catch (err: any) {
+    logger.warn({ err: err?.message ?? String(err), campaignId }, '[campaigns] TTS pre-render failed — probe audio will be missing');
+    return null;
+  }
+}
+
 router.post('/', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const userId = c.get('user').sub;
@@ -702,6 +739,16 @@ router.post('/', requireRole('tenant_admin'), async (c) => {
     createdBy: userId,
     status: 'draft',
   }).returning();
+
+  // ai-screen mode: render probe prompt audio if a prompt was provided.
+  if (row.dialMode === 'ai_screen' && body.probePromptText && !body.probePromptAudioId) {
+    const audioId = await renderProbePromptAudio(tenantId, row.id, body.probePromptText);
+    if (audioId) {
+      await db.update(campaigns).set({ probePromptAudioId: audioId }).where(eq(campaigns.id, row.id));
+      row.probePromptAudioId = audioId;
+    }
+  }
+
   const { cacheDelPattern } = await import('../../lib/redis');
   await cacheDelPattern(`campaigns:${tenantId}*`);
   return c.json(row, 201);
@@ -731,11 +778,36 @@ router.put('/:id', requireRole('tenant_admin'), async (c) => {
     await validateCampaignLeadLists(tenantId, updateData.leadListIds ?? []);
   }
 
+  // Detect probe-prompt change: if the text is being updated and no explicit
+  // audioId was provided, force re-render. Saves operators from having to
+  // toggle anything special when they edit the probe.
+  let regenProbeAudio = false;
+  if (updateData.probePromptText !== undefined && !updateData.probePromptAudioId) {
+    const [existing] = await db.select({
+      probePromptText: campaigns.probePromptText,
+      probePromptAudioId: campaigns.probePromptAudioId,
+    }).from(campaigns).where(eq(campaigns.id, c.req.param('id')));
+    if (existing && existing.probePromptText !== updateData.probePromptText) {
+      regenProbeAudio = true;
+    } else if (!existing?.probePromptAudioId) {
+      regenProbeAudio = true;
+    }
+  }
+
   const [row] = await db.update(campaigns)
     .set({ ...updateData, updatedAt: new Date() })
     .where(and(eq(campaigns.id, c.req.param('id')), eq(campaigns.tenantId, tenantId)))
     .returning();
   if (!row) throw new NotFound('Campaign not found');
+
+  if (regenProbeAudio && row.dialMode === 'ai_screen' && row.probePromptText) {
+    const audioId = await renderProbePromptAudio(tenantId, row.id, row.probePromptText);
+    if (audioId) {
+      await db.update(campaigns).set({ probePromptAudioId: audioId }).where(eq(campaigns.id, row.id));
+      row.probePromptAudioId = audioId;
+    }
+  }
+
   const { cacheDelPattern } = await import('../../lib/redis');
   await cacheDelPattern(`campaigns:${tenantId}*`);
 
