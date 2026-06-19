@@ -76,23 +76,43 @@ router.get('/', async (c) => {
     db.select({ total: count() }).from(tenants).where(where),
   ]);
 
-  // Enrich with wallet balance + plan name
+  // Enrich with wallet balance, plan name, and primary admin email.
+  // Admin email is needed by the edit modal's password-reset section, which
+  // reads from the list-row directly without a follow-up detail fetch.
   const tenantIds = rows.map((r) => r.id);
   const planIds = rows.map((r) => r.planId).filter((id): id is string => !!id);
-  const [allWallets, allPlans] = await Promise.all([
+  const [allWallets, allPlans, allAdmins] = await Promise.all([
     tenantIds.length > 0
       ? db.select({ tenantId: wallets.tenantId, balance: wallets.balance }).from(wallets).where(inArray(wallets.tenantId, tenantIds))
       : Promise.resolve([]),
     planIds.length > 0
       ? db.select({ id: plans.id, name: plans.name }).from(plans).where(inArray(plans.id, planIds))
       : Promise.resolve([]),
+    tenantIds.length > 0
+      ? db.select({ tenantId: users.tenantId, email: users.email, firstName: users.firstName, lastName: users.lastName })
+          .from(users)
+          .where(and(inArray(users.tenantId, tenantIds), eq(users.role, 'tenant_admin'), isNull(users.deletedAt)))
+          .orderBy(users.createdAt)
+      : Promise.resolve([]),
   ]);
   const planNameMap = Object.fromEntries(allPlans.map((p) => [p.id, p.name]));
-  const data = rows.map((r) => ({
-    ...r,
-    walletBalance: Number(allWallets.find((w) => w.tenantId === r.id)?.balance ?? 0),
-    planName: r.planId ? planNameMap[r.planId] ?? null : null,
-  }));
+  // First admin (oldest createdAt) wins if a tenant has multiple.
+  const adminMap = new Map<string, { email: string | null; firstName: string | null; lastName: string | null }>();
+  for (const a of allAdmins) {
+    if (a.tenantId && !adminMap.has(a.tenantId)) adminMap.set(a.tenantId, { email: a.email, firstName: a.firstName, lastName: a.lastName });
+  }
+  const data = rows.map((r) => {
+    const admin = adminMap.get(r.id);
+    return {
+      ...r,
+      walletBalance: Number(allWallets.find((w) => w.tenantId === r.id)?.balance ?? 0),
+      planName: r.planId ? planNameMap[r.planId] ?? null : null,
+      adminEmail: admin?.email ?? null,
+      adminFirstName: admin?.firstName ?? null,
+      adminLastName: admin?.lastName ?? null,
+      adminName: admin ? [admin.firstName, admin.lastName].filter(Boolean).join(' ') || null : null,
+    };
+  });
 
   const result = paginatedResponse(data, Number(total), raw);
   await cacheSet(cacheKey, result, 30);
