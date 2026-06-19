@@ -2,7 +2,9 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { eq, and, like, desc, count, inArray, sql, isNull, isNotNull } from 'drizzle-orm';
 import { db } from '../../db/client';
-import { campaigns, leads, calls, users, dids, queues, ivrMenuActions, leadLists } from '../../db/schema';
+import { campaigns, leads, calls, users, dids, queues, ivrMenuActions, leadLists, audioFiles } from '../../db/schema';
+import { synthesizeTts } from '../../integrations/gpu';
+import { uploadFile } from '../../integrations/minio';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
 import { NotFound, BadRequest } from '../../lib/errors';
 import { requireRole } from '../../middleware/roles';
@@ -13,7 +15,7 @@ const router = new Hono();
 const campaignSchema = z.object({
   name: z.string().min(1),
   status: z.enum(['running', 'paused', 'draft', 'completed']).optional(),
-  dialMode: z.enum(['preview', 'progressive', 'predictive', 'power', 'voicebot']).default('progressive'),
+  dialMode: z.enum(['preview', 'progressive', 'predictive', 'power', 'voicebot', 'ai_screen']).default('progressive'),
   leadListId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
   leadListIds: z.array(z.string().uuid()).optional(),
   leadListStrategy: z.enum(['sequential', 'round_robin', 'ratio']).default('sequential'),
@@ -22,21 +24,29 @@ const campaignSchema = z.object({
   voicebotConfigId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
   rateCardId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
   scriptId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
-  // dial_ratio and max_abandon_rate are numeric(6,2) — max 9999.99. Clamp
-  // input so a bad value returns 400 (with a clear message) instead of a
-  // postgres "numeric field overflow" 500.
+  // dial_ratio is numeric(4,2) → max 99.99, but a sane predictive ratio is well
+  // under 10. maxAbandonRate is a percentage, so 0–100. Validate before
+  // touching Postgres so we 400 with a useful message instead of a 500
+  // "numeric field overflow".
   dialRatio: z.union([z.number(), z.string()])
     .transform((v) => Number(v))
-    .pipe(z.number().min(0.1).max(20.0))
-    .transform(String)
+    .pipe(z.number().min(0.1).max(1000))
+    .transform((n) => n.toFixed(2))
     .default('1.0'),
+  multipleLines: z.coerce.number().int().min(1).max(1000).default(1),
+  broadcastEnabled: z.boolean().nullable().default(false),
+  broadcastAudioId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
+  vmAudioId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
+  probePromptText: z.string().max(500).nullable().optional(),
+  probePromptAudioId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
+  probeEvalPrompt: z.string().max(4000).nullable().optional(),
   maxAbandonRate: z.union([z.number(), z.string()])
     .transform((v) => Number(v))
     .pipe(z.number().min(0).max(100))
-    .transform(String)
+    .transform((n) => n.toFixed(2))
     .default('3.0'),
-  wrapUpSeconds: z.coerce.number().int().min(0).max(600).default(30),
-  ringTimeoutSeconds: z.coerce.number().int().min(5).max(120).default(25),
+  wrapUpSeconds: z.coerce.number().int().default(30),
+  ringTimeoutSeconds: z.coerce.number().int().default(25),
   amdEnabled: z.boolean().nullable().default(false),
   amdTimeoutMs: z.coerce.number().int().default(3500),
   amdAction: z.string().default('hangup'),
@@ -49,8 +59,8 @@ const campaignSchema = z.object({
     carrierId: z.string().uuid(),
     priority: z.coerce.number().int().min(1),
   })).optional(),
-  scheduledStart: z.coerce.date().nullable().optional(),
-  scheduledEnd: z.coerce.date().nullable().optional(),
+  scheduledStart: z.preprocess((v) => v === '' ? null : v, z.coerce.date().nullable().optional()),
+  scheduledEnd: z.preprocess((v) => v === '' ? null : v, z.coerce.date().nullable().optional()),
   dialingDays: z.array(z.string()).nullable().default(['Mon', 'Tue', 'Wed', 'Thu', 'Fri']),
   dialingStartTime: z.string().default('09:00'),
   dialingEndTime: z.string().default('17:00'),
@@ -77,7 +87,11 @@ async function validateCampaignLeadLists(tenantId: string, listIds: string[]): P
   if (listIds.length === 0) return;
   const picked = await db.select({ id: leadLists.id, name: leadLists.name, assignmentType: leadLists.assignmentType }).from(leadLists)
     .where(and(inArray(leadLists.id, listIds), eq(leadLists.tenantId, tenantId)));
-  if (picked.length !== listIds.length) throw new BadRequest('One or more lead lists not found');
+  if (picked.length !== listIds.length) {
+    const foundIds = new Set(picked.map((l) => l.id));
+    const missing = listIds.filter((id) => !foundIds.has(id));
+    throw new BadRequest(`Lead list(s) not found or not in this tenant: ${missing.join(', ')}`);
+  }
   const blocked = picked.filter((l) => l.assignmentType === 'agents');
   if (blocked.length > 0) {
     throw new BadRequest(`Lead list(s) in agent-only mode can't be used by campaigns: ${blocked.map((l) => l.name).join(', ')}`);
@@ -667,6 +681,38 @@ router.post('/:id/test-call', requireRole('tenant_admin'), async (c) => {
 });
 
 // Create campaign
+/**
+ * Render the campaign's probe_prompt_text via the GPU TTS service, upload the
+ * resulting WAV to R2, insert an audio_files row, and return its UUID. Used
+ * by ai-screen mode to avoid per-call TTS latency: the prompt only changes on
+ * save, so we render once and play from cache for every subsequent call.
+ *
+ * Best-effort — failures are logged but do not block campaign save. The
+ * dialer logs a warning and skips ai-screen calls until the audio is set.
+ */
+async function renderProbePromptAudio(tenantId: string, campaignId: string, text: string): Promise<string | null> {
+  try {
+    const wav = await synthesizeTts(text);
+    const key = `audio/${tenantId}/probe-${campaignId}.wav`;
+    await uploadFile(key, wav, 'audio/wav');
+    const [row] = await db.insert(audioFiles).values({
+      tenantId,
+      name: `probe-${campaignId}`,
+      description: `AI-screen probe prompt (auto-generated TTS)`,
+      minioKey: key,
+      format: 'wav',
+      sizeBytes: wav.length,
+      source: 'tts',
+      ttsText: text,
+      category: 'ai_probe',
+    }).returning({ id: audioFiles.id });
+    return row?.id ?? null;
+  } catch (err: any) {
+    logger.warn({ err: err?.message ?? String(err), campaignId }, '[campaigns] TTS pre-render failed — probe audio will be missing');
+    return null;
+  }
+}
+
 router.post('/', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const userId = c.get('user').sub;
@@ -693,6 +739,16 @@ router.post('/', requireRole('tenant_admin'), async (c) => {
     createdBy: userId,
     status: 'draft',
   }).returning();
+
+  // ai-screen mode: render probe prompt audio if a prompt was provided.
+  if (row.dialMode === 'ai_screen' && body.probePromptText && !body.probePromptAudioId) {
+    const audioId = await renderProbePromptAudio(tenantId, row.id, body.probePromptText);
+    if (audioId) {
+      await db.update(campaigns).set({ probePromptAudioId: audioId }).where(eq(campaigns.id, row.id));
+      row.probePromptAudioId = audioId;
+    }
+  }
+
   const { cacheDelPattern } = await import('../../lib/redis');
   await cacheDelPattern(`campaigns:${tenantId}*`);
   return c.json(row, 201);
@@ -722,13 +778,51 @@ router.put('/:id', requireRole('tenant_admin'), async (c) => {
     await validateCampaignLeadLists(tenantId, updateData.leadListIds ?? []);
   }
 
+  // Detect probe-prompt change: if the text is being updated and no explicit
+  // audioId was provided, force re-render. Saves operators from having to
+  // toggle anything special when they edit the probe.
+  let regenProbeAudio = false;
+  if (updateData.probePromptText !== undefined && !updateData.probePromptAudioId) {
+    const [existing] = await db.select({
+      probePromptText: campaigns.probePromptText,
+      probePromptAudioId: campaigns.probePromptAudioId,
+    }).from(campaigns).where(eq(campaigns.id, c.req.param('id')));
+    if (existing && existing.probePromptText !== updateData.probePromptText) {
+      regenProbeAudio = true;
+    } else if (!existing?.probePromptAudioId) {
+      regenProbeAudio = true;
+    }
+  }
+
   const [row] = await db.update(campaigns)
     .set({ ...updateData, updatedAt: new Date() })
     .where(and(eq(campaigns.id, c.req.param('id')), eq(campaigns.tenantId, tenantId)))
     .returning();
   if (!row) throw new NotFound('Campaign not found');
+
+  if (regenProbeAudio && row.dialMode === 'ai_screen' && row.probePromptText) {
+    const audioId = await renderProbePromptAudio(tenantId, row.id, row.probePromptText);
+    if (audioId) {
+      await db.update(campaigns).set({ probePromptAudioId: audioId }).where(eq(campaigns.id, row.id));
+      row.probePromptAudioId = audioId;
+    }
+  }
+
   const { cacheDelPattern } = await import('../../lib/redis');
   await cacheDelPattern(`campaigns:${tenantId}*`);
+
+  // Sync dialer state if status field was touched. Without this, saving the
+  // form with status='running' silently leaves the dialer stopped because
+  // only the dedicated /status route was wiring start/stop before.
+  if ('status' in updateData) {
+    const { startCampaignDialer, stopCampaignDialer } = await import('../../esl/dialer');
+    if (row.status === 'running' || row.status === 'active') {
+      startCampaignDialer(row.id);
+    } else {
+      stopCampaignDialer(row.id);
+    }
+  }
+
   return c.json(row);
 });
 
