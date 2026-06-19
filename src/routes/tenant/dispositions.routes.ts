@@ -21,19 +21,17 @@ const dispositionSchema = z.object({
   sortOrder: z.coerce.number().int().default(0),
 });
 
-// Toggle system disposition enabled/disabled for this tenant
+// Toggle system disposition enabled/disabled for this tenant.
+// System dispositions live as a static list in the frontend constants
+// (SYSTEM_DISPOSITIONS); they are not seeded into the DB. The "override"
+// stored here is just (tenantId, code, enabled) — label/category/etc. are
+// overlaid by the frontend from the canonical constants.
 router.put('/system/:key/toggle', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const key = c.req.param('key');
   const body = z.object({ enabled: z.boolean() }).parse(await c.req.json());
 
-  // Find the system disposition by code
-  const [systemDisp] = await db.select().from(dispositions)
-    .where(and(eq(dispositions.code, key), isNull(dispositions.tenantId)));
-
-  if (!systemDisp) throw new NotFound('System disposition not found');
-
-  // Check if tenant already has an override
+  // Existing tenant override → update.
   const [existing] = await db.select().from(dispositions)
     .where(and(eq(dispositions.code, key), eq(dispositions.tenantId, tenantId)));
 
@@ -45,11 +43,13 @@ router.put('/system/:key/toggle', requireRole('tenant_admin'), async (c) => {
     return c.json(row);
   }
 
-  // Create tenant override
+  // No override yet → create one. code/label use the key; the frontend
+  // resolves the display label/category from SYSTEM_DISPOSITIONS.
   const [row] = await db.insert(dispositions).values({
-    ...systemDisp,
-    id: undefined as any,
     tenantId,
+    code: key,
+    label: key,
+    category: 'system',
     enabled: body.enabled,
     isSystem: false,
   }).returning();
