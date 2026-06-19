@@ -45,8 +45,8 @@ const campaignSchema = z.object({
     .pipe(z.number().min(0).max(100))
     .transform((n) => n.toFixed(2))
     .default('3.0'),
-  wrapUpSeconds: z.coerce.number().int().default(30),
-  ringTimeoutSeconds: z.coerce.number().int().default(25),
+  wrapUpSeconds: z.coerce.number().int().min(0).max(600).default(30),
+  ringTimeoutSeconds: z.coerce.number().int().min(5).max(120).default(25),
   amdEnabled: z.boolean().nullable().default(false),
   amdTimeoutMs: z.coerce.number().int().default(3500),
   amdAction: z.string().default('hangup'),
