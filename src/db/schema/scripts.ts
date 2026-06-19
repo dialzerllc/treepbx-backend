@@ -6,6 +6,7 @@ export const scripts = pgTable('scripts', {
   tenantId: uuid('tenant_id').notNull().references(() => tenants.id),
   name: text('name').notNull(),
   description: text('description'),
+  status: text('status').notNull().default('draft'),
   steps: jsonb('steps').default([]),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),

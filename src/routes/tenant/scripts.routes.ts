@@ -10,8 +10,9 @@ import { requireRole } from '../../middleware/roles';
 const router = new Hono();
 
 const scriptSchema = z.object({
-  name: z.string().min(1),
-  description: z.string().nullable().optional(),
+  name: z.string().min(1).max(200),
+  description: z.string().max(2000).nullable().optional(),
+  status: z.enum(['draft', 'active', 'archived']).default('draft'),
   steps: z.array(z.record(z.unknown())).optional(),
 });
 
