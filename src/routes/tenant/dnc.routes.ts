@@ -10,9 +10,12 @@ import { requireRole } from '../../middleware/roles';
 const router = new Hono();
 
 const dncSchema = z.object({
-  phone: z.string().min(1),
-  reason: z.string().nullable().optional(),
-  source: z.string().default('manual'),
+  // E.164 maxes at 15 digits; 32 leaves room for "+", dashes, spaces, parens
+  // that users commonly paste in. Restrict the character set so junk strings
+  // can't pollute the table.
+  phone: z.string().min(1).max(32).regex(/^[+0-9\-() .]+$/, 'Phone can only contain digits, +, -, spaces, parens, and dots'),
+  reason: z.string().max(500).nullable().optional(),
+  source: z.string().max(32).default('manual'),
 });
 
 // Named routes before /:id
