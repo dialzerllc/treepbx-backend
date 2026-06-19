@@ -31,9 +31,9 @@ const updateTenantSchema = z.object({
   industry: z.string().nullable().optional(),
   status: z.enum(['trial', 'active', 'suspended', 'cancelled']).optional(),
   planId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
-  maxAgents: z.coerce.number().int().default(1).optional(),
-  maxConcurrentCalls: z.coerce.number().int().default(1).optional(),
-  maxDids: z.coerce.number().int().default(1).optional(),
+  maxAgents: z.coerce.number().int().min(1).max(100000).default(1).optional(),
+  maxConcurrentCalls: z.coerce.number().int().min(1).max(100000).default(1).optional(),
+  maxDids: z.coerce.number().int().min(1).max(100000).default(1).optional(),
   billingEmail: optionalEmail(),
   timezone: z.string().nullable().optional(),
   domain: z.string().nullable().optional(),
@@ -47,7 +47,9 @@ const updateTenantSchema = z.object({
 });
 
 const creditSchema = z.object({
-  amount: z.number().positive(),
+  // wallet.balance is numeric(12,4) → max 99999999.9999. Cap a single credit
+  // operation at 1M so even repeated maxed-out credits stay well below that.
+  amount: z.number().positive().max(1000000),
   description: z.string().nullable().optional(),
   note: z.string().nullable().optional(),
   reference: z.string().nullable().optional(),

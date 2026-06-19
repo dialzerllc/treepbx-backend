@@ -8,16 +8,24 @@ import { NotFound, BadRequest } from '../../lib/errors';
 
 const router = new Hono();
 
+// price_monthly/price_yearly/included_credit are numeric(10,2) in postgres
+// (max 99999999.99). Validate the string parses to a number in range so we
+// 400 instead of letting postgres throw "numeric field overflow".
+const moneyString = z.string().refine((v) => {
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 && n <= 99999999.99;
+}, { message: 'Must be a number between 0 and 99999999.99' });
+
 const planSchema = z.object({
-  name: z.string().min(1),
-  slug: z.string().min(1).regex(/^[a-z0-9-]+$/),
-  priceMonthly: z.string(),
-  priceYearly: z.string(),
-  maxAgents: z.coerce.number().int().default(1),
-  maxConcurrentCalls: z.coerce.number().int().default(1),
-  maxDids: z.coerce.number().int().default(1),
+  name: z.string().min(1).max(100),
+  slug: z.string().min(1).max(60).regex(/^[a-z0-9-]+$/),
+  priceMonthly: moneyString,
+  priceYearly: moneyString,
+  maxAgents: z.coerce.number().int().min(1).max(100000).default(1),
+  maxConcurrentCalls: z.coerce.number().int().min(1).max(100000).default(1),
+  maxDids: z.coerce.number().int().min(1).max(100000).default(1),
   rateGroupId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
-  includedCredit: z.string().default('0'),
+  includedCredit: moneyString.default('0'),
   features: z.array(z.unknown()).default([]),
   popular: z.boolean().nullable().default(false),
   active: z.boolean().nullable().default(true),
