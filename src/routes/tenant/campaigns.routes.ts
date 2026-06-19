@@ -721,6 +721,9 @@ router.post('/', requireRole('tenant_admin'), async (c) => {
   if (body.scheduledStart && body.scheduledStart.getTime() < Date.now()) {
     throw new BadRequest('Start date cannot be in the past');
   }
+  if (body.scheduledStart && body.scheduledEnd && body.scheduledEnd.getTime() < body.scheduledStart.getTime()) {
+    throw new BadRequest('End date cannot be earlier than start date');
+  }
 
   // Check duplicate campaign name within tenant
   const [dup] = await db.select({ id: campaigns.id }).from(campaigns)
@@ -762,6 +765,10 @@ router.post('/', requireRole('tenant_admin'), async (c) => {
 router.put('/:id', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const body = campaignSchema.partial().parse(await c.req.json());
+
+  if (body.scheduledStart && body.scheduledEnd && body.scheduledEnd.getTime() < body.scheduledStart.getTime()) {
+    throw new BadRequest('End date cannot be earlier than start date');
+  }
 
   // Check duplicate campaign name within tenant (exclude self)
   if (body.name) {
