@@ -718,6 +718,10 @@ router.post('/', requireRole('tenant_admin'), async (c) => {
   const userId = c.get('user').sub;
   const body = campaignSchema.parse(await c.req.json());
 
+  if (body.scheduledStart && body.scheduledStart.getTime() < Date.now()) {
+    throw new BadRequest('Start date cannot be in the past');
+  }
+
   // Check duplicate campaign name within tenant
   const [dup] = await db.select({ id: campaigns.id }).from(campaigns)
     .where(and(eq(campaigns.name, body.name), eq(campaigns.tenantId, tenantId)));
