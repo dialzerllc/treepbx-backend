@@ -112,6 +112,8 @@ export async function getMe(userId: string) {
       settings: users.settings,
       status: users.status,
       statusChangedAt: users.statusChangedAt,
+      sipUsername: users.sipUsername,
+      sipDomain: users.sipDomain,
     })
     .from(users)
     .where(eq(users.id, userId))
