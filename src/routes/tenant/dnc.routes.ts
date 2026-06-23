@@ -13,7 +13,14 @@ const dncSchema = z.object({
   // E.164 maxes at 15 digits; 32 leaves room for "+", dashes, spaces, parens
   // that users commonly paste in. Restrict the character set so junk strings
   // can't pollute the table.
-  phone: z.string().min(1).max(32).regex(/^[+0-9\-() .]+$/, 'Phone can only contain digits, +, -, spaces, parens, and dots'),
+  phone: z.string()
+    .min(1)
+    .max(32)
+    .regex(/^[+0-9\-() .]+$/, 'Phone can only contain digits, +, -, spaces, parens, and dots')
+    .refine((v) => {
+      const digits = v.replace(/\D/g, '');
+      return digits.length >= 7 && digits.length <= 15;
+    }, { message: 'Phone must contain 7 to 15 digits' }),
   reason: z.string().max(500).nullable().optional(),
   source: z.string().max(32).default('manual'),
 });
