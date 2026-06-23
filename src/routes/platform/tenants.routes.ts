@@ -7,6 +7,7 @@ import { tenants, users, wallets, transactions, plans } from '../../db/schema';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
 import { NotFound, BadRequest } from '../../lib/errors';
 import { hashPassword } from '../../lib/password';
+import { requireRole } from '../../middleware/roles';
 
 const router = new Hono();
 
@@ -182,7 +183,7 @@ router.put('/:id', async (c) => {
 });
 
 // Reset tenant admin password
-router.put('/:id/reset-password', async (c) => {
+router.put('/:id/reset-password', requireRole('super_admin'), async (c) => {
   const tenantId = c.req.param('id');
   const body = z.object({ password: z.string().min(8) }).parse(await c.req.json());
   const [admin] = await db.select({ id: users.id }).from(users)
