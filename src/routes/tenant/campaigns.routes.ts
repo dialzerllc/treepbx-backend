@@ -62,8 +62,12 @@ const campaignSchema = z.object({
   scheduledStart: z.preprocess((v) => v === '' ? null : v, z.coerce.date().nullable().optional()),
   scheduledEnd: z.preprocess((v) => v === '' ? null : v, z.coerce.date().nullable().optional()),
   dialingDays: z.array(z.string()).nullable().default(['Mon', 'Tue', 'Wed', 'Thu', 'Fri']),
-  dialingStartTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Must be HH:MM (24-hour)').default('09:00'),
-  dialingEndTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Must be HH:MM (24-hour)').default('17:00'),
+  // PostgreSQL `time` columns return HH:MM:SS, so accept both forms and
+  // normalize down to HH:MM for storage/validation.
+  dialingStartTime: z.preprocess((v) => typeof v === 'string' ? v.slice(0, 5) : v,
+    z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Must be HH:MM (24-hour)').default('09:00')),
+  dialingEndTime: z.preprocess((v) => typeof v === 'string' ? v.slice(0, 5) : v,
+    z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Must be HH:MM (24-hour)').default('17:00')),
   scheduleTimezone: z.string().default('America/New_York'),
   maxCallsPerDay: z.coerce.number().int().min(0).max(1000000).default(0),
   maxAttemptsPerLead: z.coerce.number().int().min(1).max(20).default(3),
