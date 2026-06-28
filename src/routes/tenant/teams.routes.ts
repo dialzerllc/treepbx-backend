@@ -20,10 +20,10 @@ const teamSchema = z.object({
 const queueSchema = z.object({
   name: z.string().min(1),
   strategy: z.enum(['longest_idle', 'round_robin', 'least_calls', 'skills_based']).default('longest_idle'),
-  maxWaitSeconds: z.coerce.number().int().default(300),
+  maxWaitSeconds: z.coerce.number().int().min(10).max(3600).default(300),
   announcePosition: z.boolean().nullable().default(true),
-  announceIntervalSeconds: z.coerce.number().int().default(30),
-  maxQueueSize: z.coerce.number().int().default(50),
+  announceIntervalSeconds: z.coerce.number().int().min(5).max(600).default(30),
+  maxQueueSize: z.coerce.number().int().min(1).max(500).default(50),
   musicOnHoldId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
   timeoutDestination: z.string().nullable().optional(),
   afterHoursEnabled: z.boolean().nullable().default(false),
