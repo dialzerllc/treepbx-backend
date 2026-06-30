@@ -6,12 +6,12 @@ import { dids, didGroups, byocCarriers, platformDids, platformDidGroups, agentDi
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
 import { NotFound, BadRequest } from '../../lib/errors';
 import { requireRole } from '../../middleware/roles';
-import { optionalUuid } from '../../lib/zod-helpers';
+import { optionalUuid, phoneField } from '../../lib/zod-helpers';
 
 const router = new Hono();
 
 const didSchema = z.object({
-  number: z.string().min(1),
+  number: phoneField(),
   description: z.string().nullable().optional(),
   cnam: z.string().max(15).nullable().optional(),
   country: z.string().default('US'),

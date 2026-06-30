@@ -38,3 +38,33 @@ export const optionalEmail = () =>
  */
 export const nullableUuid = () =>
   z.string().nullable().optional().transform((v) => v && v.length > 10 ? v : null);
+
+// E.164 phones carry 7–15 digits. Allow common formatting characters that
+// users routinely paste in (+, dashes, spaces, parens, dots) and cap raw
+// length at 32. Junk like "0", "123", or "000000000000000000" is rejected.
+const PHONE_REGEX = /^[+0-9\-() .]+$/;
+const PHONE_MSG = 'Phone can only contain digits, +, -, spaces, parens, and dots';
+const DIGITS_MSG = 'Phone must contain 7 to 15 digits';
+
+export const phoneField = () =>
+  z.string()
+    .min(1, 'Phone is required')
+    .max(32)
+    .regex(PHONE_REGEX, PHONE_MSG)
+    .refine((v) => {
+      const digits = v.replace(/\D/g, '');
+      return digits.length >= 7 && digits.length <= 15;
+    }, { message: DIGITS_MSG });
+
+// For optional/nullable contact phones (admin contacts, lead alt phone,
+// etc). Empty string and null become null; anything else must validate.
+export const nullablePhoneField = () =>
+  z.string().nullable().optional()
+    .transform((v) => (typeof v === 'string' ? v.trim() : v))
+    .transform((v) => (v === '' ? null : v))
+    .refine((v) => v == null || PHONE_REGEX.test(v), { message: PHONE_MSG })
+    .refine((v) => {
+      if (v == null) return true;
+      const digits = v.replace(/\D/g, '');
+      return digits.length >= 7 && digits.length <= 15;
+    }, { message: DIGITS_MSG });

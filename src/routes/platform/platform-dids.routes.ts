@@ -5,11 +5,12 @@ import { db } from '../../db/client';
 import { platformDids, platformDidGroups } from '../../db/schema';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
 import { NotFound, BadRequest } from '../../lib/errors';
+import { phoneField } from '../../lib/zod-helpers';
 
 const router = new Hono();
 
 const didSchema = z.object({
-  number: z.string().min(1),
+  number: phoneField(),
   provider: z.preprocess((v) => (typeof v === 'string' && v.trim() === '') ? 'unspecified' : v, z.string().min(1).default('unspecified')),
   city: z.string().nullable().optional(),
   state: z.string().nullable().optional(),
@@ -230,6 +231,9 @@ router.post('/', async (c) => {
 // hanging the browser with N sequential POSTs.
 router.post('/bulk-import', async (c) => {
   const body = z.object({
+    // Bulk import collects per-row results so one bad line doesn't reject
+    // the whole upload — keep the schema permissive here and validate per
+    // row below.
     numbers: z.array(z.string().min(1)).min(1).max(10000),
     groupId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
     country: z.string().default('US'),
@@ -246,7 +250,16 @@ router.post('/bulk-import', async (c) => {
 
   // Dedupe within the upload itself, then insert with onConflictDoNothing on
   // the unique `number` index so existing DIDs are silently skipped.
-  const uniqueNumbers = Array.from(new Set(body.numbers.map((n) => n.trim()).filter(Boolean)));
+  const isValidDid = (raw: string) => {
+    if (!raw || raw.length > 32) return false;
+    if (!/^[+0-9\-() .]+$/.test(raw)) return false;
+    const digits = raw.replace(/\D/g, '');
+    return digits.length >= 7 && digits.length <= 15;
+  };
+  const trimmed = body.numbers.map((n) => n.trim()).filter(Boolean);
+  const valid = trimmed.filter(isValidDid);
+  const rejected = trimmed.length - valid.length;
+  const uniqueNumbers = Array.from(new Set(valid));
   const values = uniqueNumbers.map((number) => ({
     number,
     groupId,
@@ -263,6 +276,7 @@ router.post('/bulk-import', async (c) => {
   return c.json({
     ok: true,
     submitted: body.numbers.length,
+    rejected,
     deduped: uniqueNumbers.length,
     created: inserted.length,
     skipped: uniqueNumbers.length - inserted.length,

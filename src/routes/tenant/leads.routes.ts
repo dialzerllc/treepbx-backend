@@ -6,14 +6,14 @@ import { leads, leadLists } from '../../db/schema';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
 import { NotFound, BadRequest } from '../../lib/errors';
 import { requireRole } from '../../middleware/roles';
-import { optionalUuid, optionalEmail } from '../../lib/zod-helpers';
+import { optionalUuid, optionalEmail, phoneField, nullablePhoneField } from '../../lib/zod-helpers';
 
 const router = new Hono();
 
 const leadSchema = z.object({
   leadListId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
-  phone: z.string().min(1),
-  altPhone: z.string().nullable().optional(),
+  phone: phoneField(),
+  altPhone: nullablePhoneField(),
   firstName: z.string().nullable().optional(),
   lastName: z.string().nullable().optional(),
   email: optionalEmail(),
@@ -40,6 +40,10 @@ router.post('/import', requireRole('tenant_admin', 'supervisor'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const body = z.object({
     leadListId: z.string().uuid(),
+    // Importer collects per-row failures rather than aborting the whole
+    // batch on one bad phone. Keep phone permissive here (just non-empty)
+    // and validate per-row inside the loop so we can report which lines
+    // were rejected and why.
     leads: z.array(z.object({
       phone: z.string().min(1),
       firstName: z.string().nullable().optional(),
@@ -62,11 +66,22 @@ router.post('/import', requireRole('tenant_admin', 'supervisor'), async (c) => {
     .where(and(eq(leadLists.id, body.leadListId), eq(leadLists.tenantId, tenantId)));
   if (!list) throw new BadRequest('Lead list not found or does not belong to this tenant');
 
+  // Per-row phone validation so a single bad line doesn't tank the import.
+  const isValidPhone = (raw: string | null | undefined) => {
+    if (!raw) return false;
+    if (raw.length > 32) return false;
+    if (!/^[+0-9\-() .]+$/.test(raw)) return false;
+    const digits = raw.replace(/\D/g, '');
+    return digits.length >= 7 && digits.length <= 15;
+  };
+
   let created = 0;
   let skipped = 0;
   const batchSize = 50;
   for (let i = 0; i < body.leads.length; i += batchSize) {
-    const batch = body.leads.slice(i, i + batchSize);
+    const batch = body.leads.slice(i, i + batchSize).filter((l) => isValidPhone(l.phone));
+    skipped += body.leads.slice(i, i + batchSize).length - batch.length;
+    if (batch.length === 0) continue;
     const values = batch.map((l) => ({
       tenantId,
       leadListId: body.leadListId,

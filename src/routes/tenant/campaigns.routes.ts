@@ -9,6 +9,7 @@ import { paginationSchema, paginate, paginatedResponse } from '../../lib/paginat
 import { NotFound, BadRequest } from '../../lib/errors';
 import { requireRole } from '../../middleware/roles';
 import { logger } from '../../lib/logger';
+import { phoneField } from '../../lib/zod-helpers';
 
 const router = new Hono();
 
@@ -572,7 +573,7 @@ router.post('/:id/rechain', requireRole('tenant_admin'), async (c) => {
 router.post('/:id/test-call', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const campaignId = c.req.param('id');
-  const body = z.object({ phoneNumber: z.string().min(7) }).parse(await c.req.json());
+  const body = z.object({ phoneNumber: phoneField() }).parse(await c.req.json());
 
   const [campaign] = await db.select().from(campaigns)
     .where(and(eq(campaigns.id, campaignId), eq(campaigns.tenantId, tenantId)));

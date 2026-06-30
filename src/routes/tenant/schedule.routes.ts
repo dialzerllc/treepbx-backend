@@ -5,6 +5,7 @@ import { db } from '../../db/client';
 import { scheduleEvents, followUpTodos } from '../../db/schema';
 import { paginationSchema, paginate, paginatedResponse } from '../../lib/pagination';
 import { NotFound } from '../../lib/errors';
+import { nullablePhoneField } from '../../lib/zod-helpers';
 
 const router = new Hono();
 
@@ -16,7 +17,7 @@ const eventSchema = z.object({
   endTime: z.string().transform((s) => new Date(s).toISOString()),
   leadId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
   leadName: z.string().nullable().optional(),
-  leadPhone: z.string().nullable().optional(),
+  leadPhone: nullablePhoneField(),
   priority: z.enum(['low', 'medium', 'high']).default('medium'),
   campaignId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
   status: z.string().default('upcoming'),
@@ -25,7 +26,7 @@ const eventSchema = z.object({
 const todoSchema = z.object({
   leadId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
   leadName: z.string().nullable().optional(),
-  leadPhone: z.string().nullable().optional(),
+  leadPhone: nullablePhoneField(),
   reason: z.string().nullable().optional(),
   priority: z.enum(['low', 'medium', 'high']).default('medium'),
   dueDate: z.string().transform((s) => new Date(s).toISOString()),

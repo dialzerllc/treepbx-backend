@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { optionalUuid, optionalEmail, email } from '../../lib/zod-helpers';
+import { optionalUuid, optionalEmail, email, nullablePhoneField } from '../../lib/zod-helpers';
 import { eq, and, like, desc, count, isNull, sql, inArray } from 'drizzle-orm';
 import { db } from '../../db/client';
 import { tenants, users, wallets, transactions, plans } from '../../db/schema';
@@ -38,7 +38,7 @@ const updateTenantSchema = z.object({
   billingEmail: optionalEmail(),
   timezone: z.string().nullable().optional(),
   domain: z.string().nullable().optional(),
-  phone: z.string().nullable().optional(),
+  phone: nullablePhoneField(),
   address: z.string().nullable().optional(),
   city: z.string().nullable().optional(),
   state: z.string().nullable().optional(),
