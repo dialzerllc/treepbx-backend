@@ -12,8 +12,8 @@ const router = new Hono();
 const menuSchema = z.object({
   name: z.string().min(1),
   welcomeAudioId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
-  timeoutSeconds: z.coerce.number().int().default(5),
-  maxRetries: z.coerce.number().int().default(3),
+  timeoutSeconds: z.coerce.number().int().min(1).max(300).default(5),
+  maxRetries: z.coerce.number().int().min(0).max(10).default(3),
   invalidAudioId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
   timeoutAudioId: z.string().nullable().optional().transform((v) => v && /^[0-9a-f-]{36}$/i.test(v) ? v : null),
   timeoutAction: z.string().default('hangup'),
