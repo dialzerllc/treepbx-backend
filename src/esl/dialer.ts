@@ -334,10 +334,10 @@ async function dialLoop(state: DialerState) {
     // active DID in the group (ordered by created_at for stable round-robin)
     // and rotate through them per-lead. Resolution per lead happens inside
     // the dial loop using `pickDidForLead` below.
-    let groupDids: { id: string; number: string }[] = [];
+    let groupDids: { id: string; number: string; cnam: string | null }[] = [];
     let groupCallerIdStrategy: string = 'fixed';
     if (campaign?.didGroupId) {
-      groupDids = await db.select({ id: dids.id, number: dids.number })
+      groupDids = await db.select({ id: dids.id, number: dids.number, cnam: dids.cnam })
         .from(dids)
         .where(and(eq(dids.didGroupId, campaign.didGroupId), eq(dids.active, true)))
         .orderBy(asc(dids.createdAt));
@@ -354,7 +354,7 @@ async function dialLoop(state: DialerState) {
         ? camp
         : (groupCallerIdStrategy === 'fixed' ? 'fixed' : groupCallerIdStrategy);
 
-    function pickDidForLead(leadPhone: string): { id: string; number: string } | null {
+    function pickDidForLead(leadPhone: string): { id: string; number: string; cnam: string | null } | null {
       if (groupDids.length === 0) return null;
       switch (effectiveStrategy) {
         case 'random':
@@ -445,9 +445,9 @@ async function dialLoop(state: DialerState) {
     // Tenant-level fallback (single DID) for when the campaign has no DID
     // group configured. The campaign-DID-group path uses pickDidForLead(),
     // which already returns null when the group is empty.
-    let tenantFallback: { id: string; number: string } | null = null;
+    let tenantFallback: { id: string; number: string; cnam: string | null } | null = null;
     if (groupDids.length === 0) {
-      const [tenantDid] = await db.select({ number: dids.number, id: dids.id })
+      const [tenantDid] = await db.select({ number: dids.number, id: dids.id, cnam: dids.cnam })
         .from(dids)
         .where(and(eq(dids.tenantId, state.tenantId), eq(dids.active, true)))
         .orderBy(asc(dids.createdAt))
@@ -473,6 +473,11 @@ async function dialLoop(state: DialerState) {
       }
       const effectiveCallerId = pickedDid.number;
       const outboundDidId = pickedDid.id;
+      // Display name shown to the called party: prefer the picked DID's
+      // CNAM. The agent's personal name is preserved internally in the CDR
+      // via `agentId` but should not be leaked to the carrier — CNAM is
+      // typically what the called party recognises ("Acme Corp" not "Selena").
+      const carrierDisplayName = pickedDid.cnam?.trim() || (agent ? `${agent.firstName} ${agent.lastName}`.trim() : 'Broadcast');
       const callerName = agent ? `${agent.firstName} ${agent.lastName}`.trim() : 'Broadcast';
 
       // Create CDR
@@ -495,7 +500,7 @@ async function dialLoop(state: DialerState) {
 
       // Originate the call via FreeSWITCH ESL
       if (eslClient.isConnected()) {
-        const safeName = callerName.replace(/[^a-zA-Z0-9 _-]/g, '');
+        const safeName = carrierDisplayName.replace(/[^a-zA-Z0-9 _-]/g, '');
         const varList = [
           `origination_caller_id_number=${effectiveCallerId}`,
           `origination_caller_id_name='${safeName}'`,

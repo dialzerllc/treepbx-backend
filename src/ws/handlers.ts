@@ -184,13 +184,28 @@ export async function handleMessage(ws: ServerWebSocket<WsData>, raw: string) {
         // number, not the internal extension. Internal ext-to-ext keeps the
         // extension as caller-ID so receiving agents can still see it.
         let resolvedCid: string | null = null;
-        if (!customCallerId && /^\+?\d{7,}$/.test(targetExt)) {
-          const r = await import('../esl/commands').then(m => m.resolveOutboundCallerId(user.sub));
+        let resolvedCidName: string | null = null;
+        const isExternalDial = /^\+?\d{7,}$/.test(targetExt);
+        if (!customCallerId && isExternalDial) {
+          const r = await import('../esl/commands').then(m => m.resolveOutboundCallerId(user.sub, targetExt));
           resolvedCid = r.number;
+          resolvedCidName = r.name;
+        }
+        // Fail closed on external dials: never present an internal extension
+        // to the carrier. Carriers either reject these or strip them to
+        // "anonymous", and either way it bypasses STIR/SHAKEN attestation
+        // and creates a compliance gap.
+        if (isExternalDial && !customCallerId && !resolvedCid) {
+          logger.warn({ from: user.sub, targetExt }, 'External dial rejected — no outbound caller-ID configured for agent or tenant');
+          ws.send(JSON.stringify({ event: 'call:error', data: {
+            message: 'No outbound caller ID configured. Assign a DID to your account or to the tenant before dialing externally.',
+            code: 'NO_CALLER_ID',
+          } }));
+          break;
         }
         const effectiveCallerId = customCallerId || resolvedCid || callerInfo.ext || user.sub;
         const callerDisplay = `${callerInfo.name}${callerInfo.ext ? ` (${callerInfo.ext})` : ''}`;
-        logger.info({ from: user.sub, callerDisplay, targetExt, callerId: effectiveCallerId, customCid: !!customCallerId, resolvedCid }, 'Call offer received');
+        logger.info({ from: user.sub, callerDisplay, targetExt, callerId: effectiveCallerId, customCid: !!customCallerId, resolvedCid, resolvedCidName }, 'Call offer received');
 
         // Look up target agent name for callee display
         const targetInfo = await (async () => {
@@ -245,7 +260,12 @@ export async function handleMessage(ws: ServerWebSocket<WsData>, raw: string) {
           try {
             const { eslClient } = await import('../esl/client');
             if (eslClient.isConnected()) {
-              const safeName = (callerInfo.name || 'TreePBX').replace(/[^a-zA-Z0-9 _-]/g, '');
+              // Display name shown to the called party: prefer the DID's
+              // CNAM (resolvedCidName, e.g. the company name) over the
+              // agent's personal name. The agent identity is still carried
+              // internally via treepbx_agent_id below.
+              const cidDisplay = resolvedCidName || callerInfo.name || 'TreePBX';
+              const safeName = cidDisplay.replace(/[^a-zA-Z0-9 _-]/g, '');
               const vars = [
                 `origination_caller_id_number=${effectiveCallerId}`,
                 `origination_caller_id_name='${safeName}'`,

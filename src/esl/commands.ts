@@ -1,6 +1,6 @@
 import { eslClient } from './client';
 import { db } from '../db/client';
-import { carriers, mediaNodes, users, dids, agentDids } from '../db/schema';
+import { carriers, mediaNodes, users, dids, agentDids, didGroups, tenants } from '../db/schema';
 import { eq, and, inArray, asc, sql, isNull } from 'drizzle-orm';
 import { execFileSync } from 'child_process';
 import { writeFileSync, unlinkSync } from 'fs';
@@ -249,53 +249,135 @@ function removeUserXmlOnNode(ip: string, sipUsername: string): void {
   ], { timeout: 10000 });
 }
 
+// Match logic with esl/dialer.ts pickDidForLead — North-American area code
+// derived from the dialed number, used by 'local_match' strategy.
+function npaOf(rawNumber: string): string {
+  const d = rawNumber.replace(/\D/g, '');
+  return d.startsWith('1') ? d.slice(1, 4) : d.slice(0, 3);
+}
+
+function applyCidStrategy<T extends { number: string }>(
+  candidates: T[],
+  strategy: string,
+  dialedNumber: string | null,
+): T | null {
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0];
+  switch (strategy) {
+    case 'random':
+      return candidates[Math.floor(Math.random() * candidates.length)];
+    case 'local_match': {
+      if (!dialedNumber) return candidates[0];
+      const targetNpa = npaOf(dialedNumber);
+      const match = candidates.find((c) => npaOf(c.number) === targetNpa);
+      return match ?? candidates[0];
+    }
+    case 'round_robin':
+    case 'sequential':
+    case 'fixed':
+    default:
+      return candidates[0];
+  }
+}
+
 /** Provision (or refresh) an FS directory entry for an agent. Safe to call on
  *  every agent create/update — overwrites the file. Returns true if at least
  *  one fs node accepted the change. */
 // Resolve the outbound caller-ID number + display name for an agent. Used by
 // pushSipUser (FS directory) AND by the click-to-call origin flow in
-// ws/handlers.ts so both paths present the same caller-ID. Order:
-//   1. agent's first assigned DID (agent_dids → dids)
-//   2. tenant's first active DID
-//   3. null (fall back to FS global ${outbound_caller_id} or extension)
-export async function resolveOutboundCallerId(agentId: string): Promise<{ number: string | null; name: string | null }> {
+// ws/handlers.ts so both paths present the same caller-ID.
+//
+// Lookup chain:
+//   1. agent's assigned DIDs (agent_dids → dids). If the assigned DIDs share
+//      a did_group_id with a caller_id_strategy, apply the strategy across
+//      that group's DIDs; otherwise pick the agent's first assigned DID.
+//   2. tenant's DIDs ordered by created_at. Picks the first active one.
+//   3. null — caller is responsible for failing the dial rather than leaking
+//      the agent's extension to the carrier.
+//
+// Display name preference: DID's cnam → tenant company name → null. The
+// agent's personal name is NOT used here; the agent is identified via
+// internal channel vars (treepbx_agent_id), not via the carrier-visible
+// Caller-ID display.
+export async function resolveOutboundCallerId(
+  agentId: string,
+  dialedNumber: string | null = null,
+): Promise<{ number: string | null; name: string | null; didId: string | null }> {
   try {
     const [agent] = await db.select({
       id: users.id,
       tenantId: users.tenantId,
-      firstName: users.firstName,
-      lastName: users.lastName,
     }).from(users)
       .where(and(eq(users.id, agentId), isNull(users.deletedAt)))
       .limit(1);
-    if (!agent) return { number: null, name: null };
-    const name = `${agent.firstName ?? ''} ${agent.lastName ?? ''}`.trim() || null;
-    const [assigned] = await db.select({ number: dids.number })
+    if (!agent) return { number: null, name: null, didId: null };
+
+    // 1a. Agent-assigned DIDs, grouped by did_group_id so we can apply the
+    //     group's strategy if all assigned DIDs share one.
+    const assigned = await db.select({
+      id: dids.id,
+      number: dids.number,
+      cnam: dids.cnam,
+      didGroupId: dids.didGroupId,
+    })
       .from(agentDids)
       .innerJoin(dids, eq(dids.id, agentDids.didId))
       .where(and(eq(agentDids.agentId, agent.id), eq(dids.active, true)))
-      .limit(1);
-    if (assigned) return { number: assigned.number, name };
-    if (agent.tenantId) {
-      const [tenantDid] = await db.select({ number: dids.number })
+      .orderBy(asc(dids.createdAt));
+
+    let picked: { id: string; number: string; cnam: string | null } | null = null;
+
+    if (assigned.length > 0) {
+      const groupIds = Array.from(new Set(assigned.map((d) => d.didGroupId).filter((g): g is string => !!g)));
+      let strategy = 'fixed';
+      if (groupIds.length === 1) {
+        const [grp] = await db.select({ s: didGroups.callerIdStrategy })
+          .from(didGroups).where(eq(didGroups.id, groupIds[0]!));
+        if (grp?.s) strategy = grp.s;
+      }
+      picked = applyCidStrategy(assigned, strategy, dialedNumber);
+    }
+
+    // 1b. Tenant-wide fallback.
+    if (!picked && agent.tenantId) {
+      const tenantDids = await db.select({
+        id: dids.id,
+        number: dids.number,
+        cnam: dids.cnam,
+      })
         .from(dids)
         .where(and(eq(dids.tenantId, agent.tenantId), eq(dids.active, true)))
-        .limit(1);
-      if (tenantDid) return { number: tenantDid.number, name };
+        .orderBy(asc(dids.createdAt));
+      if (tenantDids.length > 0) {
+        picked = applyCidStrategy(tenantDids, 'fixed', dialedNumber);
+      }
     }
-    return { number: null, name };
+
+    if (!picked) return { number: null, name: null, didId: null };
+
+    // Display name preference: DID CNAM → tenant company name → null.
+    let displayName: string | null = picked.cnam?.trim() || null;
+    if (!displayName && agent.tenantId) {
+      const [t] = await db.select({ name: tenants.name }).from(tenants)
+        .where(eq(tenants.id, agent.tenantId)).limit(1);
+      displayName = t?.name?.trim() || null;
+    }
+
+    return { number: picked.number, name: displayName, didId: picked.id };
   } catch (err: any) {
     logger.warn({ err: err?.message ?? String(err), agentId }, '[esl] resolveOutboundCallerId failed');
-    return { number: null, name: null };
+    return { number: null, name: null, didId: null };
   }
 }
 
-async function resolveOutboundCallerIdBySip(sipUsername: string): Promise<{ number: string | null; name: string | null }> {
+async function resolveOutboundCallerIdBySip(sipUsername: string): Promise<{ number: string | null; name: string | null; didId: string | null }> {
   const [agent] = await db.select({ id: users.id }).from(users)
     .where(and(eq(users.sipUsername, sipUsername), isNull(users.deletedAt)))
     .limit(1);
-  if (!agent) return { number: null, name: null };
-  return resolveOutboundCallerId(agent.id);
+  if (!agent) return { number: null, name: null, didId: null };
+  // pushSipUser doesn't know the dialed number at provision time, so the
+  // FS directory entry gets the deterministic 'fixed' pick.
+  return resolveOutboundCallerId(agent.id, null);
 }
 
 export async function pushSipUser(sipUsername: string): Promise<boolean> {

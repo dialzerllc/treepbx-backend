@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { eq, and, like, desc, count, inArray, sql, isNull, isNotNull } from 'drizzle-orm';
+import { eq, and, like, desc, count, inArray, sql, isNull, isNotNull, asc } from 'drizzle-orm';
 import { db } from '../../db/client';
 import { campaigns, leads, calls, users, dids, queues, ivrMenuActions, leadLists, audioFiles } from '../../db/schema';
 import { synthesizeTts } from '../../integrations/gpu';
@@ -579,16 +579,33 @@ router.post('/:id/test-call', requireRole('tenant_admin'), async (c) => {
     .where(and(eq(campaigns.id, campaignId), eq(campaigns.tenantId, tenantId)));
   if (!campaign) throw new NotFound('Campaign not found');
 
-  // Resolve caller ID from campaign DID group
-  let callerId = 'treepbx';
+  // Resolve caller ID from campaign DID group. Test-call MUST present a
+  // real DID — previously this fell back to the literal string "treepbx"
+  // which carriers reject. Require either a campaign DID group or a
+  // tenant-level active DID, else 400.
+  const { dids } = await import('../../db/schema');
   let didId: string | null = null;
   let didNumber: string | null = null;
+  let didCnam: string | null = null;
   if (campaign.didGroupId) {
-    const { dids } = await import('../../db/schema');
-    const [did] = await db.select({ id: dids.id, number: dids.number }).from(dids)
-      .where(and(eq(dids.didGroupId, campaign.didGroupId), eq(dids.active, true))).limit(1);
-    if (did) { callerId = did.number; didId = did.id; didNumber = did.number; }
+    const [did] = await db.select({ id: dids.id, number: dids.number, cnam: dids.cnam }).from(dids)
+      .where(and(eq(dids.didGroupId, campaign.didGroupId), eq(dids.active, true)))
+      .orderBy(asc(dids.createdAt))
+      .limit(1);
+    if (did) { didId = did.id; didNumber = did.number; didCnam = did.cnam; }
   }
+  if (!didNumber) {
+    // Last-resort: any active DID owned by this tenant.
+    const [td] = await db.select({ id: dids.id, number: dids.number, cnam: dids.cnam }).from(dids)
+      .where(and(eq(dids.tenantId, tenantId), eq(dids.active, true)))
+      .orderBy(asc(dids.createdAt))
+      .limit(1);
+    if (td) { didId = td.id; didNumber = td.number; didCnam = td.cnam; }
+  }
+  if (!didNumber) {
+    throw new BadRequest('No active DID configured. Assign a DID group to this campaign or activate a tenant DID before running a test call.');
+  }
+  const callerId = didNumber;
 
   // Resolve gateway with failover
   let gateways: string[] = [];
@@ -667,7 +684,8 @@ router.post('/:id/test-call', requireRole('tenant_admin'), async (c) => {
     }
   }
 
-  const safeName = campaign.name.replace(/[^a-zA-Z0-9 _-]/g, '');
+  // Carrier-visible display name: DID's CNAM → campaign name.
+  const safeName = (didCnam?.trim() || campaign.name).replace(/[^a-zA-Z0-9 _-]/g, '');
   const vars = [
     `origination_caller_id_number=${callerId}`,
     `origination_caller_id_name='${safeName}'`,
