@@ -53,11 +53,10 @@ router.get('/transactions', async (c) => {
 router.post('/topup', requireRole('super_admin', 'platform_supervisor', 'tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
   const body = z.object({
-    // Mirror the platform-admin credit endpoint: wallet.balance is
-    // numeric(12,4) so the absolute ceiling is 99,999,999.9999. Cap a
-    // single top-up at $1M so even repeated maxed-out top-ups can't
-    // overflow the column.
-    amount: z.number().positive().max(1_000_000, 'Amount cannot exceed $1,000,000 in a single top-up'),
+    // Tenant self-service ceiling: $10K per top-up. Lower than the
+    // platform-admin credit cap on purpose — admins can credit larger
+    // amounts via /platform/tenants/:id/credit (still capped at $1M).
+    amount: z.number().positive().max(10_000, 'Amount cannot exceed $10,000 in a single top-up'),
     description: z.string().nullable().optional(),
     reference: z.string().nullable().optional(),
     paymentMethod: z.string().nullable().optional(),
