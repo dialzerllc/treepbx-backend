@@ -17,6 +17,13 @@ const teamSchema = z.object({
   skills: z.array(z.string()).nullable().optional().default([]),
 });
 
+// A team with zero agents can't take calls, so creation is atomic: name +
+// at least one valid agent in the same request. Updates can still mutate
+// agents via PUT /:id/agents.
+const createTeamSchema = teamSchema.extend({
+  agentIds: z.array(z.string().uuid()).min(1, 'A team must have at least one agent'),
+});
+
 const queueSchema = z.object({
   name: z.string().min(1),
   strategy: z.enum(['longest_idle', 'round_robin', 'least_calls', 'skills_based']).default('longest_idle'),
@@ -123,16 +130,38 @@ router.get('/:id', async (c) => {
   return c.json({ ...team, queue: queue ?? null, members });
 });
 
-// Create team
+// Create team — atomic: validates ≥1 agent belongs to the tenant and
+// assigns them in a transaction with the team insert.
 router.post('/', requireRole('tenant_admin'), async (c) => {
   const tenantId = c.get('tenantId')!;
-  const body = teamSchema.parse(await c.req.json());
+  const { isNull } = await import('drizzle-orm');
+  const body = createTeamSchema.parse(await c.req.json());
+  const { agentIds, ...teamData } = body;
 
   const [dup] = await db.select({ id: teams.id }).from(teams)
     .where(and(eq(teams.name, body.name), eq(teams.tenantId, tenantId)));
   if (dup) throw new BadRequest('Team name already exists');
 
-  const [row] = await db.insert(teams).values({ ...body, tenantId }).returning();
+  // Confirm every agentId is a real, non-deleted user under this tenant.
+  // Without this check, a caller could attach foreign agentIds and the
+  // update below would silently no-op for them.
+  const validAgents = await db.select({ id: users.id }).from(users)
+    .where(and(
+      eq(users.tenantId, tenantId),
+      inArray(users.id, agentIds),
+      isNull(users.deletedAt),
+    ));
+  if (validAgents.length !== agentIds.length) {
+    throw new BadRequest('One or more agent IDs do not belong to this tenant');
+  }
+
+  const row = await db.transaction(async (tx) => {
+    const [created] = await tx.insert(teams).values({ ...teamData, tenantId }).returning();
+    await tx.update(users).set({ teamId: created.id })
+      .where(and(eq(users.tenantId, tenantId), inArray(users.id, agentIds)));
+    return created;
+  });
+
   const { cacheDelPattern } = await import('../../lib/redis');
   await cacheDelPattern(`teams:${tenantId}*`);
   return c.json(row, 201);
