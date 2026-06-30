@@ -2,6 +2,7 @@ import { eslClient } from './client';
 import { db } from '../db/client';
 import { carriers, mediaNodes, users, dids, agentDids, didGroups, tenants } from '../db/schema';
 import { eq, and, inArray, asc, sql, isNull } from 'drizzle-orm';
+import { applyCidStrategy } from './caller-id-strategy';
 import { execFileSync } from 'child_process';
 import { writeFileSync, unlinkSync } from 'fs';
 import { logger } from '../lib/logger';
@@ -247,37 +248,6 @@ function removeUserXmlOnNode(ip: string, sipUsername: string): void {
     `docker exec ${DOCKER_CONTAINER} rm -f /etc/freeswitch/directory/default/${sipUsername}.xml && ` +
     `docker exec ${DOCKER_CONTAINER} fs_cli -p ${ESL_PW_FOR_SHIP} -x 'reloadxml'`,
   ], { timeout: 10000 });
-}
-
-// Match logic with esl/dialer.ts pickDidForLead — North-American area code
-// derived from the dialed number, used by 'local_match' strategy.
-function npaOf(rawNumber: string): string {
-  const d = rawNumber.replace(/\D/g, '');
-  return d.startsWith('1') ? d.slice(1, 4) : d.slice(0, 3);
-}
-
-function applyCidStrategy<T extends { number: string }>(
-  candidates: T[],
-  strategy: string,
-  dialedNumber: string | null,
-): T | null {
-  if (candidates.length === 0) return null;
-  if (candidates.length === 1) return candidates[0];
-  switch (strategy) {
-    case 'random':
-      return candidates[Math.floor(Math.random() * candidates.length)];
-    case 'local_match': {
-      if (!dialedNumber) return candidates[0];
-      const targetNpa = npaOf(dialedNumber);
-      const match = candidates.find((c) => npaOf(c.number) === targetNpa);
-      return match ?? candidates[0];
-    }
-    case 'round_robin':
-    case 'sequential':
-    case 'fixed':
-    default:
-      return candidates[0];
-  }
 }
 
 /** Provision (or refresh) an FS directory entry for an agent. Safe to call on
